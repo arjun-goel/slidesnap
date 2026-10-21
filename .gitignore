@@ -1,0 +1,22 @@
+# Python & Virtual Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Runtime Storage & Databases (Do not commit temporary student jobs)
+backend/storage/
+storage/
+*.db
+*.sqlite3
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db

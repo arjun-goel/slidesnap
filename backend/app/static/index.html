@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SlideSnap — AI & CV Lecture Slide Extractor for Students</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      background: radial-gradient(circle at 15% 10%, rgba(56, 189, 248, 0.10), transparent 35%),
+                  radial-gradient(circle at 85% 20%, rgba(99, 102, 241, 0.12), transparent 40%),
+                  #090D16;
+      color: #F8FAFC;
+      min-height: 100vh;
+    }
+    .glass-card {
+      background: rgba(15, 23, 42, 0.78);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .shimmer-bar {
+      background: linear-gradient(90deg, #0ea5e9 0%, #6366f1 50%, #10b981 100%);
+      background-size: 200% 100%;
+      animation: gradientMove 2.2s linear infinite;
+    }
+    @keyframes gradientMove {
+      0% { background-position: 0% 50%; }
+      100% { background-position: 200% 50%; }
+    }
+  </style>
+</head>
+<body class="antialiased selection:bg-sky-500 selection:text-white">
+
+  <!-- Top Navigation -->
+  <header class="border-b border-slate-800/80 bg-slate-950/60 backdrop-blur-md sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-sky-500/20">
+          <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="font-extrabold text-lg tracking-tight text-white">SlideSnap</span>
+            <span class="text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+              100% Free Student Edition
+            </span>
+          </div>
+          <p class="text-xs text-slate-400">CV Lecture Slide Extractor • Presenter De-Occlusion • Searchable PDF</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3 text-xs text-slate-400">
+        <span id="healthBadge" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900 border border-slate-700 text-slate-300">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          CV Worker Active
+        </span>
+        <a href="/docs" target="_blank" class="px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-200 font-medium transition">
+          OpenAPI Docs ↗
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+    <!-- Hero + Job Creation Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+
+      <!-- Left Column: Job Submission Card (7 cols) -->
+      <section class="lg:col-span-7 glass-card rounded-2xl p-6 sm:p-8 shadow-2xl">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-6">
+          <div>
+            <h1 class="text-2xl font-bold text-white tracking-tight">Extract Clean Lecture Slides to PDF</h1>
+            <p class="text-sm text-slate-400 mt-1">
+              Automatically removes walking presenters, blurry frames, playback bars, and duplicate slides.
+            </p>
+          </div>
+        </div>
+
+        <!-- Mode Selector Tabs -->
+        <div class="grid grid-cols-3 gap-2 p-1 rounded-xl bg-slate-900/90 border border-slate-800 mb-6" role="tablist">
+          <button type="button" onclick="switchMode('youtube')" id="tab-youtube"
+            class="py-2.5 px-3 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-2 bg-sky-500 text-white shadow">
+            <span>▶ YouTube URL</span>
+          </button>
+          <button type="button" onclick="switchMode('upload')" id="tab-upload"
+            class="py-2.5 px-3 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-2 text-slate-400 hover:text-white">
+            <span>📁 Upload Lecture (.MP4)</span>
+          </button>
+          <button type="button" onclick="switchMode('demo')" id="tab-demo"
+            class="py-2.5 px-3 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-2 text-amber-300 hover:text-amber-200">
+            <span>✨ Instant CV Demo</span>
+          </button>
+        </div>
+
+        <form id="jobForm" onsubmit="handleJobSubmit(event)" class="space-y-5">
+          <!-- Mode 1: YouTube URL Input -->
+          <div id="panel-youtube" class="space-y-3">
+            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-300">
+              YouTube Lecture Link (Public / Creative Commons / Authorized)
+            </label>
+            <input
+              type="url"
+              id="youtubeUrl"
+              placeholder="https://www.youtube.com/watch?v=..."
+              class="w-full px-4 py-3 rounded-xl bg-slate-900/90 border border-slate-700/80 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-mono"
+            />
+            <p class="text-xs text-slate-400 leading-relaxed">
+              💡 <strong class="text-slate-300">Note on Cloud Datacenter IPs:</strong> If YouTube blocks automated cloud downloads with a bot check, switch to the <button type="button" onclick="switchMode('upload')" class="text-sky-400 underline">Direct MP4 Upload</button> tab or test our <button type="button" onclick="switchMode('demo')" class="text-amber-300 underline">Instant CV Demo Lecture</button>.
+            </p>
+          </div>
+
+          <!-- Mode 2: Direct Video Upload -->
+          <div id="panel-upload" class="hidden space-y-3">
+            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-300">
+              Select Lecture Recording (.mp4, .mkv, .webm — Max 500 MB)
+            </label>
+            <input
+              type="file"
+              id="videoFile"
+              accept="video/mp4,video/webm,video/x-matroska"
+              class="w-full px-4 py-3 rounded-xl bg-slate-900/90 border border-dashed border-slate-600 text-sm text-slate-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-sky-500/20 file:text-sky-300 hover:file:bg-sky-500/30"
+            />
+          </div>
+
+          <!-- Mode 3: Synthetic CV Demo Lecture -->
+          <div id="panel-demo" class="hidden rounded-xl bg-amber-500/10 border border-amber-500/30 p-4 space-y-2">
+            <div class="flex items-center gap-2 text-amber-300 font-semibold text-sm">
+              <span>🔬 Built-in Computer Vision Benchmark Lecture (CS-401 Deep Learning)</span>
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed">
+              Generates a realistic 720p lecture video on the fly with <strong>4 slides + 1 revisited duplicate slide</strong>, featuring:
+            </p>
+            <ul class="text-xs text-slate-300 list-disc list-inside space-y-1">
+              <li><strong>Slide 1:</strong> Presenter stands in front of equations, then steps away (Clean Frame Ranking).</li>
+              <li><strong>Slide 2:</strong> Presenter <em>never</em> leaves the screen, walking across the slide (triggers <strong>Multi-Frame Temporal Median De-Occlusion</strong> to erase the presenter!).</li>
+              <li><strong>Slide 3:</strong> Camera autofocus blur at transition followed by sharp focus (Laplacian Blur Rejection).</li>
+              <li><strong>Slide 4 + Revisit:</strong> Playback control bar removal & global perceptual hash deduplication.</li>
+            </ul>
+          </div>
+
+          <!-- Custom Title -->
+          <div>
+            <label class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1.5">
+              Custom PDF Deck Title (Optional)
+            </label>
+            <input
+              type="text"
+              id="customTitle"
+              placeholder="e.g., CS229 Machine Learning — Lecture 4 Notes"
+              class="w-full px-4 py-2.5 rounded-xl bg-slate-900/90 border border-slate-700/80 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
+            />
+          </div>
+
+          <!-- Computer Vision Pipeline Controls -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <label class="flex items-start gap-3 p-3 rounded-xl bg-slate-900/70 border border-slate-800 cursor-pointer hover:border-slate-700 transition">
+              <input type="checkbox" id="enableInpainting" checked class="mt-1 rounded bg-slate-800 border-slate-600 text-sky-500 focus:ring-sky-500" />
+              <div>
+                <span class="block text-xs font-semibold text-white">Multi-Frame Presenter De-Occlusion</span>
+                <span class="block text-[11px] text-slate-400">Fuses unobstructed pixels across nearby frames when teacher covers the slide.</span>
+              </div>
+            </label>
+            <label class="flex items-start gap-3 p-3 rounded-xl bg-slate-900/70 border border-slate-800 cursor-pointer hover:border-slate-700 transition">
+              <input type="checkbox" id="enableOcr" checked class="mt-1 rounded bg-slate-800 border-slate-600 text-sky-500 focus:ring-sky-500" />
+              <div>
+                <span class="block text-xs font-semibold text-white">OCR & Layout Indexing</span>
+                <span class="block text-[11px] text-slate-400">Indexes slide text blocks and stamps timestamps into the compiled PDF.</span>
+              </div>
+            </label>
+          </div>
+
+          <!-- Mandatory Copyright & YouTube ToS Attestation -->
+          <div class="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/30">
+            <label class="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" id="rightsAttested" required class="mt-1 rounded bg-slate-900 border-indigo-400 text-indigo-500 focus:ring-indigo-500" />
+              <span class="text-xs text-slate-300 leading-relaxed">
+                <strong class="text-indigo-300">Copyright & Terms of Service Attestation (Required):</strong>
+                I confirm that I own this lecture recording, that it is licensed under Creative Commons, or that I have explicit authorization from my instructor/institution to extract slides for personal educational study.
+              </span>
+            </label>
+          </div>
+
+          <div id="formError" class="hidden p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200"></div>
+
+          <button
+            type="submit"
+            id="submitBtn"
+            class="w-full py-3.5 px-6 rounded-xl font-bold text-sm text-white bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 shadow-lg shadow-sky-500/25 transition flex items-center justify-center gap-2"
+          >
+            <span>🚀 Extract Clean Lecture Slides & Generate PDF</span>
+          </button>
+        </form>
+      </section>
+
+      <!-- Right Column: CV Pipeline Architecture & Live Telemetry (5 cols) -->
+      <aside class="lg:col-span-5 space-y-6">
+        <!-- Active Job Live Status Card -->
+        <div id="activeJobPanel" class="glass-card rounded-2xl p-6 border border-sky-500/30 shadow-xl">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-xs font-bold uppercase tracking-wider text-sky-400">Active Job Pipeline</span>
+            <span id="activeJobStatusBadge" class="text-xs font-mono px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300">
+              Idle
+            </span>
+          </div>
+
+          <h2 id="activeJobTitle" class="text-base font-bold text-white truncate">
+            Submit a lecture or click "Instant CV Demo" to begin
+          </h2>
+          <p id="activeJobDetail" class="text-xs text-slate-400 mt-1">
+            Asynchronous worker queue ready.
+          </p>
+
+          <!-- Progress Bar -->
+          <div class="mt-4">
+            <div class="flex justify-between text-xs font-mono text-slate-300 mb-1.5">
+              <span id="activeStageName">Stage: Standby</span>
+              <span id="activeProgressPct">0%</span>
+            </div>
+            <div class="w-full h-2.5 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
+              <div id="activeProgressBar" class="h-full shimmer-bar transition-all duration-300" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <!-- Stats Row -->
+          <div class="grid grid-cols-3 gap-2 mt-5 pt-4 border-t border-slate-800/80 text-center">
+            <div class="p-2 rounded-lg bg-slate-900/60">
+              <span class="block text-[11px] text-slate-400">Sampled Frames</span>
+              <span id="statFrames" class="text-sm font-bold font-mono text-white">0</span>
+            </div>
+            <div class="p-2 rounded-lg bg-slate-900/60">
+              <span class="block text-[11px] text-slate-400">Unique Slides</span>
+              <span id="statSlides" class="text-sm font-bold font-mono text-emerald-400">0</span>
+            </div>
+            <div class="p-2 rounded-lg bg-slate-900/60">
+              <span class="block text-[11px] text-slate-400">De-Occluded</span>
+              <span id="statReconstructed" class="text-sm font-bold font-mono text-amber-300">0</span>
+            </div>
+          </div>
+
+          <!-- Action Controls (Download / Cancel / Retry) -->
+          <div id="activeJobActions" class="mt-5 flex flex-wrap gap-2"></div>
+        </div>
+
+        <!-- How the 6-Stage CV Engine Works -->
+        <div class="glass-card rounded-2xl p-6 space-y-3">
+          <h3 class="text-sm font-bold uppercase tracking-wider text-slate-200">
+            How SlideSnap's De-Occlusion Pipeline Works
+          </h3>
+          <div class="space-y-2.5 text-xs text-slate-300">
+            <div class="flex items-start gap-2.5">
+              <span class="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 font-mono font-bold">1</span>
+              <p><strong>Scene Regime Clustering:</strong> Computes 64-bit perceptual <code class="text-sky-300">dHash</code> + fast <code class="text-sky-300">SSIM</code> to isolate stable slide intervals and reject cross-dissolve transitions.</p>
+            </div>
+            <div class="flex items-start gap-2.5">
+              <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono font-bold">2</span>
+              <p><strong>Presenter & Blur Ranking:</strong> Segments the teacher's silhouette/skin/motion mask and scores background Laplacian sharpness to pick the clearest unobstructed frame.</p>
+            </div>
+            <div class="flex items-start gap-2.5">
+              <span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono font-bold">3</span>
+              <p><strong>Temporal Median Reconstruction:</strong> If the teacher never leaves the slide, SlideSnap aligns frames as they walk and fuses only unobstructed background pixels, labeling reconstructed slides in the PDF.</p>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- Extracted Slides Preview Gallery (Shown when a job has slides) -->
+    <section id="slidesGallerySection" class="hidden glass-card rounded-2xl p-6 sm:p-8">
+      <div class="flex flex-wrap items-center justify-between gap-4 mb-6">
+        <div>
+          <h2 class="text-xl font-bold text-white">Extracted Clean Slide Deck Preview</h2>
+          <p class="text-xs text-slate-400">
+            Chronological order preserved • Duplicate revisits automatically removed • Reconstructed slides clearly badged
+          </p>
+        </div>
+        <div id="galleryDownloadTop"></div>
+      </div>
+
+      <div id="slidesGrid" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
+    </section>
+
+    <!-- Job History Table -->
+    <section class="glass-card rounded-2xl p-6 sm:p-8">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-lg font-bold text-white">Recent Lecture Jobs (Auto-Cleaned After 24h)</h2>
+          <p class="text-xs text-slate-400">Click any job row to inspect its extracted slides and CV quality scores.</p>
+        </div>
+        <button onclick="loadJobHistory()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 transition">
+          ↻ Refresh
+        </button>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse text-xs sm:text-sm">
+          <thead>
+            <tr class="border-b border-slate-800 text-slate-400 text-xs uppercase">
+              <th class="py-3 px-3">Lecture Title</th>
+              <th class="py-3 px-3">Source</th>
+              <th class="py-3 px-3">Status</th>
+              <th class="py-3 px-3">Slides (De-Occluded)</th>
+              <th class="py-3 px-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="jobHistoryBody" class="divide-y divide-slate-800/60 text-slate-200">
+            <tr>
+              <td colspan="5" class="py-6 text-center text-slate-500">No jobs yet. Run the Instant CV Demo or paste a link above!</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let currentMode = 'youtube';
+    let activeJobId = null;
+    let pollTimer = null;
+
+    function switchMode(mode) {
+      currentMode = mode;
+      ['youtube', 'upload', 'demo'].forEach((m) => {
+        const tab = document.getElementById(`tab-${m}`);
+        const panel = document.getElementById(`panel-${m}`);
+        if (m === mode) {
+          tab.className = 'py-2.5 px-3 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-2 bg-sky-500 text-white shadow';
+          panel.classList.remove('hidden');
+        } else {
+          tab.className = 'py-2.5 px-3 rounded-lg text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-2 text-slate-400 hover:text-white';
+          panel.classList.add('hidden');
+        }
+      });
+      if (mode === 'demo') {
+        document.getElementById('rightsAttested').checked = true;
+      }
+    }
+
+    async function handleJobSubmit(e) {
+      e.preventDefault();
+      const errBox = document.getElementById('formError');
+      errBox.classList.add('hidden');
+
+      const rightsAttested = document.getElementById('rightsAttested').checked;
+      const enableInpainting = document.getElementById('enableInpainting').checked;
+      const enableOcr = document.getElementById('enableOcr').checked;
+      const customTitle = document.getElementById('customTitle').value.trim();
+      const submitBtn = document.getElementById('submitBtn');
+
+      if (!rightsAttested) {
+        errBox.textContent = 'Please check the Copyright & Terms of Service attestation box.';
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span>⏳ Enqueuing Job on CV Worker...</span>';
+
+      try {
+        let res;
+        if (currentMode === 'upload') {
+          const fileInput = document.getElementById('videoFile');
+          if (!fileInput.files || !fileInput.files[0]) {
+            throw new Error('Please choose a video file (.mp4, .webm, .mkv) to upload.');
+          }
+          const formData = new FormData();
+          formData.append('video_file', fileInput.files[0]);
+          formData.append('rights_attested', String(rightsAttested));
+          formData.append('enable_temporal_inpainting', String(enableInpainting));
+          formData.append('enable_ocr_indexing', String(enableOcr));
+          if (customTitle) formData.append('custom_title', customTitle);
+
+          res = await fetch('/api/jobs/upload', { method: 'POST', body: formData });
+        } else {
+          const sourceUrl = document.getElementById('youtubeUrl').value.trim();
+          if (currentMode === 'youtube' && !sourceUrl) {
+            throw new Error('Please paste a valid YouTube lecture URL, or switch to the Instant CV Demo tab.');
+          }
+          const payload = {
+            source_type: currentMode === 'demo' ? 'demo_lecture' : 'youtube',
+            source_url: currentMode === 'youtube' ? sourceUrl : null,
+            rights_attested: rightsAttested,
+            enable_temporal_inpainting: enableInpainting,
+            enable_ocr_indexing: enableOcr,
+            custom_title: customTitle || null,
+          };
+          res = await fetch('/api/jobs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+        }
+
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.detail ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : 'Failed to create job';
+          throw new Error(detail);
+        }
+
+        selectJob(data.id);
+        loadJobHistory();
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span>🚀 Extract Clean Lecture Slides & Generate PDF</span>';
+      }
+    }
+
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    function selectJob(jobId) {
+      activeJobId = jobId;
+      if (pollTimer) clearInterval(pollTimer);
+      fetchActiveJob();
+      pollTimer = setInterval(fetchActiveJob, 1200);
+    }
+
+    async function fetchActiveJob() {
+      if (!activeJobId) return;
+      try {
+        const res = await fetch(`/api/jobs/${activeJobId}`);
+        if (!res.ok) return;
+        const job = await res.json();
+        renderActiveJob(job);
+        if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          loadJobHistory();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function renderActiveJob(job) {
+      document.getElementById('activeJobTitle').textContent = job.video_title;
+      document.getElementById('activeJobDetail').textContent = job.error_message || job.current_stage_detail;
+      document.getElementById('activeStageName').textContent = `Status: ${job.status.replace(/_/g, ' ').toUpperCase()}`;
+      document.getElementById('activeProgressPct').textContent = `${job.progress_pct}%`;
+      document.getElementById('activeProgressBar').style.width = `${job.progress_pct}%`;
+
+      document.getElementById('statFrames').textContent = job.total_candidate_frames;
+      document.getElementById('statSlides').textContent = job.extracted_slide_count || (job.slides ? job.slides.length : 0);
+      document.getElementById('statReconstructed').textContent = job.reconstructed_slide_count;
+
+      const badge = document.getElementById('activeJobStatusBadge');
+      const statusColors = {
+        completed: 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40',
+        failed: 'bg-rose-500/20 text-rose-300 border border-rose-500/40',
+        cancelled: 'bg-slate-700 text-slate-300',
+      };
+      badge.className = `text-xs font-mono px-2.5 py-0.5 rounded-full ${statusColors[job.status] || 'bg-sky-500/20 text-sky-300 border border-sky-500/40'}`;
+      badge.textContent = job.status;
+
+      const actionsDiv = document.getElementById('activeJobActions');
+      actionsDiv.innerHTML = '';
+
+      if (job.status === 'completed' && job.pdf_download_url) {
+        const sizeKb = job.pdf_file_size_bytes ? `${Math.round(job.pdf_file_size_bytes / 1024)} KB` : '';
+        actionsDiv.innerHTML = `
+          <a href="${job.pdf_download_url}" target="_blank"
+             class="w-full py-3 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition">
+            <span>⬇ Download Clean Slide PDF (${sizeKb})</span>
+          </a>
+        `;
+      } else if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
+        actionsDiv.innerHTML = `
+          <button onclick="cancelJob('${job.id}')"
+             class="py-2 px-4 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 text-xs font-semibold transition">
+            ✕ Cancel Job
+          </button>
+        `;
+      } else if (job.status === 'failed' || job.status === 'cancelled') {
+        actionsDiv.innerHTML = `
+          <button onclick="retryJob('${job.id}')"
+             class="py-2 px-4 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/40 text-sky-200 text-xs font-semibold transition">
+            ↻ Retry Job
+          </button>
+          <button onclick="switchMode('demo')"
+             class="py-2 px-4 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 text-xs font-semibold transition">
+            ✨ Try Instant CV Demo Instead
+          </button>
+        `;
+      }
+
+      // Render Slide Gallery
+      const gallerySec = document.getElementById('slidesGallerySection');
+      const grid = document.getElementById('slidesGrid');
+      const topDl = document.getElementById('galleryDownloadTop');
+
+      if (job.slides && job.slides.length > 0) {
+        gallerySec.classList.remove('hidden');
+        if (job.pdf_download_url) {
+          topDl.innerHTML = `
+            <a href="${job.pdf_download_url}" target="_blank"
+               class="py-2.5 px-5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm inline-flex items-center gap-2 shadow">
+              ⬇ Download Compiled PDF (${job.slides.length} Slides)
+            </a>
+          `;
+        } else {
+          topDl.innerHTML = '';
+        }
+
+        grid.innerHTML = job.slides.map((s) => {
+          const badgeHtml = s.was_reconstructed
+            ? `<span class="px-2.5 py-1 rounded-md bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[11px] font-semibold">
+                 ✨ Reconstructed (${s.reconstruction_method.replace(/_/g, ' ')})
+               </span>`
+            : `<span class="px-2.5 py-1 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold">
+                 ✓ Unobstructed Direct Frame
+               </span>`;
+
+          return `
+            <div class="rounded-xl bg-slate-900/90 border border-slate-800 overflow-hidden flex flex-col shadow-lg">
+              <div class="p-3 bg-slate-950/70 border-b border-slate-800 flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="px-2.5 py-0.5 rounded bg-sky-500 text-slate-950 font-extrabold text-xs">
+                    Slide #${s.slide_number}
+                  </span>
+                  <span class="text-xs font-mono text-slate-400">
+                    ${formatTime(s.timestamp_start_sec)} – ${formatTime(s.timestamp_end_sec)}
+                  </span>
+                </div>
+                ${badgeHtml}
+              </div>
+              <div class="relative bg-black aspect-video">
+                <img src="${s.image_url}" alt="Slide ${s.slide_number}" class="w-full h-full object-contain" loading="lazy" />
+              </div>
+              <div class="p-3.5 space-y-2 text-xs">
+                <div class="flex flex-wrap items-center justify-between text-slate-400 font-mono text-[11px]">
+                  <span>Quality: <strong class="text-white">${(s.final_quality_score * 100).toFixed(1)}%</strong></span>
+                  <span>Sharpness: <strong class="text-white">${s.sharpness_score.toFixed(0)}</strong></span>
+                  <span>Residual Occlusion: <strong class="text-emerald-400">${(s.person_occlusion_ratio * 100).toFixed(2)}%</strong></span>
+                  <span>dHash: <code class="text-sky-400">${s.perceptual_hash.slice(0, 8)}</code></span>
+                </div>
+                <p class="text-slate-300 bg-slate-950/60 p-2 rounded border border-slate-800/80 truncate" title="${s.ocr_text}">
+                  🔍 ${s.ocr_text}
+                </p>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } else {
+        gallerySec.classList.add('hidden');
+      }
+    }
+
+    async function cancelJob(id) {
+      await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
+      fetchActiveJob();
+    }
+
+    async function retryJob(id) {
+      await fetch(`/api/jobs/${id}/retry`, { method: 'POST' });
+      selectJob(id);
+    }
+
+    async function loadJobHistory() {
+      try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) return;
+        const jobs = await res.json();
+        const tbody = document.getElementById('jobHistoryBody');
+        if (!jobs.length) return;
+
+        tbody.innerHTML = jobs.map((j) => {
+          const statusBadge = j.status === 'completed'
+            ? '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-xs font-mono">completed</span>'
+            : j.status === 'failed'
+            ? '<span class="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 text-xs font-mono">failed</span>'
+            : `<span class="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 text-xs font-mono">${j.status} (${j.progress_pct}%)</span>`;
+
+          const dlBtn = j.pdf_download_url
+            ? `<a href="${j.pdf_download_url}" target="_blank" onclick="event.stopPropagation()" class="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 font-semibold text-xs">⬇ PDF</a>`
+            : '';
+
+          return `
+            <tr onclick="selectJob('${j.id}')" class="hover:bg-slate-800/50 cursor-pointer transition">
+              <td class="py-3 px-3 font-medium text-white max-w-xs truncate">${j.video_title}</td>
+              <td class="py-3 px-3 font-mono text-xs text-slate-400">${j.source_type}</td>
+              <td class="py-3 px-3">${statusBadge}</td>
+              <td class="py-3 px-3 font-mono text-xs">${j.extracted_slide_count} slides (${j.reconstructed_slide_count} reconstructed)</td>
+              <td class="py-3 px-3 text-right space-x-2">
+                ${dlBtn}
+                <button class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs">Inspect</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      loadJobHistory();
+    });
+  </script>
+</body>
+</html>

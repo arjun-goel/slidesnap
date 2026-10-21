@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  slidesnap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7860:7860"
+    environment:
+      - MAX_JOBS_PER_HOUR=15
+      - MAX_CONCURRENT_WORKERS=2
+      - RETENTION_HOURS=24
+      - SAMPLE_FPS=2.0
+    volumes:
+      - slidesnap_data:/home/user/app/storage
+    restart: unless-stopped
+
+volumes:
+  slidesnap_data:
