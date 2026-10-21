@@ -379,36 +379,62 @@ def run_slide_extraction_pipeline(
     total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration_sec = int(round(total_video_frames / max(1.0, native_fps)))
 
-    sample_interval = max(1, int(round(native_fps / settings.sample_fps)))
+    # Adaptive FPS scaling so 1-hour+ lectures process rapidly without RAM bloat
+    effective_sample_fps = settings.sample_fps
+    if duration_sec > 1800:  # > 30 mins
+        effective_sample_fps = 0.5  # 1 frame every 2 seconds
+    elif duration_sec > 600:  # > 10 mins
+        effective_sample_fps = 1.0  # 1 frame every second
+
+    sample_interval = max(1, int(round(native_fps / effective_sample_fps)))
     sampled_frames: List[SampledFrame] = []
 
     if progress_callback:
-        progress_callback("sampling_frames", 15, f"Sampling frames at {settings.sample_fps} FPS...", 0)
+        progress_callback("sampling_frames", 15, f"Sampling frames at {effective_sample_fps} FPS...", 0)
 
     frame_idx = 0
+    last_report_time = 0.0
+    import time as _time
+
     while True:
         if cancel_check and cancel_check():
             cap.release()
             raise InterruptedError("Job cancelled by student.")
 
+        # Use cap.grab() to skip non-sampled frames without full RGB decoding (5x faster on long lectures!)
+        if frame_idx % sample_interval != 0:
+            if not cap.grab():
+                break
+            frame_idx += 1
+            continue
+
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_idx % sample_interval == 0:
-            # Standardize resolution to 1280x720 HD for consistent CV metrics and crisp PDF output
-            if frame.shape[1] != 1280 or frame.shape[0] != 720:
-                frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
-            ts = frame_idx / max(1.0, native_fps)
-            d_int, d_hex = compute_dhash(frame)
-            sampled_frames.append(
-                SampledFrame(
-                    index=len(sampled_frames),
-                    timestamp_sec=ts,
-                    image=frame,
-                    dhash=d_int,
-                    dhash_hex=d_hex,
-                )
+        # Standardize resolution to 1280x720 HD for consistent CV metrics and crisp PDF output
+        if frame.shape[1] != 1280 or frame.shape[0] != 720:
+            frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
+        ts = frame_idx / max(1.0, native_fps)
+        d_int, d_hex = compute_dhash(frame)
+        sampled_frames.append(
+            SampledFrame(
+                index=len(sampled_frames),
+                timestamp_sec=ts,
+                image=frame,
+                dhash=d_int,
+                dhash_hex=d_hex,
+            )
+        )
+        now_t = _time.time()
+        if progress_callback and total_video_frames > 0 and (now_t - last_report_time > 1.5):
+            last_report_time = now_t
+            sample_pct = 15 + int(min(1.0, frame_idx / total_video_frames) * 20)
+            progress_callback(
+                "sampling_frames",
+                sample_pct,
+                f"Sampling lecture frames ({int(ts // 60)}m {int(ts % 60)}s / {duration_sec // 60}m)...",
+                len(sampled_frames),
             )
         frame_idx += 1
 

@@ -20,9 +20,9 @@ class Settings:
     db_path: Path = DB_PATH
 
     # Rate Limiting & Resource Controls ($0 Free-Tier Guardrails)
-    max_jobs_per_hour_per_ip: int = int(os.getenv("MAX_JOBS_PER_HOUR", "10"))
+    max_jobs_per_hour_per_ip: int = int(os.getenv("MAX_JOBS_PER_HOUR", "15"))
     max_concurrent_workers: int = int(os.getenv("MAX_CONCURRENT_WORKERS", "2"))
-    max_video_duration_sec: int = int(os.getenv("MAX_VIDEO_DURATION_SEC", "7200"))  # 2 hours
+    max_video_duration_sec: int = int(os.getenv("MAX_VIDEO_DURATION_SEC", "14400"))  # 4 hours
     max_upload_size_mb: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
     retention_hours: int = int(os.getenv("RETENTION_HOURS", "24"))
     max_retries: int = 2
