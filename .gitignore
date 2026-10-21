@@ -17,6 +17,9 @@ storage/
 .env.*
 !.env.example
 
-# OS
+# OS & Tunnel Binaries
 .DS_Store
 Thumbs.db
+cloudflared.exe
+*.exe
+
