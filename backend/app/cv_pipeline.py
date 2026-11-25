@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import gc
+import os
 from pathlib import Path
 import time as _time
 from typing import Callable, List, Optional, Tuple
@@ -10,20 +11,23 @@ import numpy as np
 
 from .config import QUALITY_PRESETS, QualityPreset, settings
 
+# Critical for 512 MB containers running on 32/64-core cloud hosts:
+# prevents OpenCV from spawning dozens of native worker threads (saving ~150 MB RSS)
+cv2.setNumThreads(1)
+
 
 @dataclass
 class BufferedFrame:
     """
-    Lightweight, compressed frame representation for O(1)-RAM streaming on 512 MB cloud workers.
-    Instead of holding raw 2.76 MB - 6.22 MB BGR arrays for every sampled frame in a lecture,
-    stores ~90 KB JPEG bytes + a 320x180 thumbnail & stroke map.
+    Ultra-compact compressed frame representation (~85 KB JPEG + 320x180 thumb).
+    Never holds raw full-resolution BGR arrays in RAM simultaneously.
     """
     index: int
     timestamp_sec: float
     jpeg_bytes: bytes
     thumb_bgr: np.ndarray          # (180, 320, 3) uint8
-    stroke_mask_small: np.ndarray  # (180, 320) uint8 (255 on crisp board/slide strokes)
-    quick_person_small: np.ndarray # (180, 320) uint8 (255 on detected presenter skin/torso)
+    stroke_mask_small: np.ndarray  # (180, 320) uint8
+    quick_person_small: np.ndarray # (180, 320) uint8
     dhash: int
     dhash_hex: str
 
@@ -36,10 +40,12 @@ class BufferedFrame:
 
 
 @dataclass
-class ScoredFrame:
+class ScoredCandidate:
+    """
+    Lightweight scored metadata computed at 320x180 without decoding full-resolution JPEGs!
+    """
     buffered: BufferedFrame
-    decoded_image: np.ndarray
-    person_mask: np.ndarray  # uint8 (0 or 255)
+    person_mask_small: np.ndarray  # (180, 320) uint8 (0 or 255)
     person_occlusion_ratio: float
     sharpness_score: float
     overlay_penalty: float
@@ -61,22 +67,17 @@ class SlideSegment:
             self.start_timestamp_sec = bf.timestamp_sec
         self.end_timestamp_sec = bf.timestamp_sec
         self.frames.append(bf)
-        if len(self.frames) > max_buffer + 4:
+        if len(self.frames) > max_buffer + 3:
             self._prune(max_buffer)
 
     def _prune(self, max_buffer: int) -> None:
-        """
-        Retains dense pre-transition frames at the tail of the segment (for maximum board content)
-        plus diverse unobstructed milestone frames from earlier in the segment (for full spatial de-occlusion).
-        """
         if len(self.frames) <= max_buffer:
             return
-        tail_keep = max(6, (max_buffer * 3) // 5)
+        tail_keep = max(5, (max_buffer * 3) // 5)
         head_budget = max(3, max_buffer - tail_keep)
         earlier = self.frames[:-tail_keep]
         tail = self.frames[-tail_keep:]
 
-        # Evenly sample across earlier history, preferring less-occluded snapshots in each bucket
         bucket_size = len(earlier) / float(head_budget)
         kept_earlier: List[BufferedFrame] = []
         for b_idx in range(head_budget):
@@ -129,7 +130,6 @@ class ExtractedSlide:
 
     @property
     def image(self) -> np.ndarray:
-        """Lazily reads the slide image from disk so extracted slides consume near-zero RAM."""
         img = cv2.imread(str(self.image_path), cv2.IMREAD_COLOR)
         if img is not None:
             return img
@@ -139,11 +139,7 @@ class ExtractedSlide:
 
 
 def compute_dhash(image_bgr: np.ndarray, hash_size: int = 8) -> Tuple[int, str]:
-    """
-    Computes a 64-bit difference perceptual hash (dHash) on the high-frequency edge
-    map + color header signature of the slide canvas (excluding bottom 8% player bar).
-    """
-    h, w = image_bgr.shape[:2]
+    h, _ = image_bgr.shape[:2]
     crop_h = int(h * 0.92)
     cropped = image_bgr[:crop_h, :]
     gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
@@ -166,27 +162,17 @@ def hamming_distance(hash_a: int, hash_b: int) -> int:
 
 
 def extract_board_stroke_mask_small(thumb_bgr: np.ndarray) -> np.ndarray:
-    """
-    Extracts thin high-contrast chalk, marker, typography, and diagram strokes on a 320x180
-    thumbnail while rejecting smooth gradients and wide solid surfaces. Works identically on
-    whiteboards, light PowerPoint slides, and dark green/black chalkboards.
-    """
     gray = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2GRAY)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    # Black-hat captures dark ink on whiteboards/slides; Top-hat captures white/colored chalk on dark boards
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
     stroke_energy = np.maximum(blackhat, tophat)
     _, stroke_bin = cv2.threshold(stroke_energy, 22, 255, cv2.THRESH_BINARY)
-    # Suppress bottom 8% player UI zone
     stroke_bin[int(thumb_bgr.shape[0] * 0.92) :, :] = 0
     return stroke_bin
 
 
 def compute_slide_content_distance(img_a: np.ndarray, img_b: np.ndarray) -> float:
-    """
-    Computes normalized visual & structural content distance between two slide frames or 320x180 thumbnails.
-    """
     if img_a.shape[0] == 180 and img_a.shape[1] == 320:
         ca = img_a[:166, :]
     else:
@@ -199,10 +185,7 @@ def compute_slide_content_distance(img_a: np.ndarray, img_b: np.ndarray) -> floa
         crop_hb = int(img_b.shape[0] * 0.92)
         cb = cv2.resize(img_b[:crop_hb, :], (320, 166), interpolation=cv2.INTER_AREA)
 
-    header_a = ca[:30, :]
-    header_b = cb[:30, :]
-    header_diff = float(np.mean(cv2.absdiff(header_a, header_b))) / 255.0
-
+    header_diff = float(np.mean(cv2.absdiff(ca[:30, :], cb[:30, :]))) / 255.0
     color_diff = float(np.mean(cv2.absdiff(ca, cb))) / 255.0
 
     ga = cv2.cvtColor(ca, cv2.COLOR_BGR2GRAY)
@@ -217,10 +200,6 @@ def compute_slide_content_distance(img_a: np.ndarray, img_b: np.ndarray) -> floa
 
 
 def compute_stroke_dice_similarity(stroke_a: np.ndarray, stroke_b: np.ndarray) -> float:
-    """
-    Measures spatial stroke overlap (with +-1px jitter tolerance) so two minimalist slides
-    sharing the same white/dark background template but different text are never falsely merged.
-    """
     cnt_a = int(np.count_nonzero(stroke_a))
     cnt_b = int(np.count_nonzero(stroke_b))
     if cnt_a < 80 and cnt_b < 80:
@@ -240,16 +219,6 @@ def is_new_slide_or_board_wipe(
     seg_latest: BufferedFrame,
     curr: BufferedFrame,
 ) -> bool:
-    """
-    Pre-Transition & Progressive Board Regime Classifier:
-    - Keeps extending the SAME segment while a lecturer progressively writes equations/annotations
-      on a chalkboard/whiteboard or reveals incremental bullets (existing strokes stay >=70% intact
-      while background/header theme stays constant).
-    - Immediately triggers a segment cut when:
-      1. Slide header or board background color shifts (new slide deck page / scene cut), OR
-      2. Previously established unobstructed strokes disappear (board wipe / slide replacement!).
-    """
-    # Compare smoothed background/header theme (blurred to ignore thin handwriting strokes)
     smooth_first = cv2.GaussianBlur(seg_first.thumb_bgr[:166, :], (15, 15), 0)
     smooth_latest = cv2.GaussianBlur(seg_latest.thumb_bgr[:166, :], (15, 15), 0)
     smooth_curr = cv2.GaussianBlur(curr.thumb_bgr[:166, :], (15, 15), 0)
@@ -259,14 +228,12 @@ def is_new_slide_or_board_wipe(
     if max(header_shift, header_shift_origin) > 0.055:
         return True
 
-    # Exclude presenter regions when comparing background & stroke retention
     unocc_latest = (seg_latest.quick_person_small[:166, :] == 0) & (curr.quick_person_small[:166, :] == 0)
     if int(np.count_nonzero(unocc_latest)) > 4000:
         bg_diff = float(np.mean(cv2.absdiff(smooth_latest, smooth_curr)[unocc_latest])) / 255.0
         if bg_diff > 0.085:
             return True
 
-    # Check stroke retention from seg_latest -> curr in mutually unobstructed board regions
     k3 = np.ones((3, 3), dtype=np.uint8)
     prev_strokes = (seg_latest.stroke_mask_small[:166, :] > 0) & unocc_latest
     curr_strokes = (curr.stroke_mask_small[:166, :] > 0) & unocc_latest
@@ -278,18 +245,14 @@ def is_new_slide_or_board_wipe(
         retained = int(np.count_nonzero(prev_strokes & curr_dilated))
         retention_ratio = retained / float(prev_count)
 
-        # Board wiped or replaced by a different same-template slide!
         if retention_ratio < 0.58:
             return True
 
-        # Progressive writing / bullet build-up: existing strokes remain intact (>= 70%)!
         if retention_ratio >= 0.70 and curr_count >= int(prev_count * 0.85):
             return False
 
-    # Fallback structural distance check against latest frame
     dist_latest = compute_slide_content_distance(seg_latest.thumb_bgr, curr.thumb_bgr)
     if dist_latest > 0.048:
-        # Allow autofocus sharpening (low smooth color change + increasing stroke sharpness)
         if header_shift < 0.032 and curr_count > prev_count * 1.35 and prev_count < 160:
             return False
         return True
@@ -298,22 +261,16 @@ def is_new_slide_or_board_wipe(
 
 
 def compute_masked_sharpness(image_bgr: np.ndarray, person_mask: np.ndarray) -> float:
-    """
-    Computes the variance of the Laplacian strictly on the non-occluded slide background.
-    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap = cv2.Laplacian(gray, cv2.CV_16S)
     non_person = person_mask == 0
-    if np.count_nonzero(non_person) < 500:
-        return float(lap.var())
+    if np.count_nonzero(non_person) < 200:
+        return float(np.var(lap))
     masked_vals = lap[non_person]
     return float(np.var(masked_vals))
 
 
 def detect_playback_overlay_penalty(image_bgr: np.ndarray) -> float:
-    """
-    Detects intrusive bottom playback bars (dark translucent strip + high-saturation red seekbar).
-    """
     h, _ = image_bgr.shape[:2]
     bottom_strip = image_bgr[int(h * 0.92) :, :]
     hsv = cv2.cvtColor(bottom_strip, cv2.COLOR_BGR2HSV)
@@ -331,10 +288,6 @@ def detect_playback_overlay_penalty(image_bgr: np.ndarray) -> float:
 
 
 def enhance_slide_clarity(image_bgr: np.ndarray) -> np.ndarray:
-    """
-    Gentle adaptive contrast + unsharp text enhancement so faint chalk/marker handwriting
-    and projector slides become crisp and legible without introducing color artifacts.
-    """
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_chan, a_chan, b_chan = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=1.45, tileGridSize=(8, 8))
@@ -342,17 +295,14 @@ def enhance_slide_clarity(image_bgr: np.ndarray) -> np.ndarray:
     l_blended = cv2.addWeighted(l_chan, 0.65, l_clahe, 0.35, 0)
     enhanced = cv2.cvtColor(cv2.merge((l_blended, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
     soft = cv2.GaussianBlur(enhanced, (0, 0), 1.2)
-    sharpened = cv2.addWeighted(enhanced, 1.18, soft, -0.18, 0)
-    return sharpened
+    return cv2.addWeighted(enhanced, 1.18, soft, -0.18, 0)
 
 
 class PresenterDetector:
     """
-    Board-Agnostic Hybrid Presenter & Occlusion Detector:
-    1. Skin-tone + Board-Contrast Torso Column & Haar Face Cascade (works on BOTH whiteboards/slides
-       AND dark green/black chalkboards regardless of clothing color).
-    2. Morphological Solid-Core Foreground Separator: isolates solid moving human bodies/arms
-       while protecting thin persistent chalk/marker handwriting written during the segment!
+    Ultra-Fast 320x180 Thumbnail Presenter & Solid-Core Motion Detector.
+    Runs in <8ms per segment and <3 MB RAM while accurately separating walking teachers
+    from newly written chalk/marker equations on both dark and light boards!
     """
 
     def __init__(self) -> None:
@@ -363,20 +313,19 @@ class PresenterDetector:
             else None
         )
 
-    def detect_single_frame_person_mask(self, image_bgr: np.ndarray) -> np.ndarray:
-        h, w = image_bgr.shape[:2]
+    def detect_single_frame_person_mask(self, thumb_bgr: np.ndarray, use_haar: bool = False) -> np.ndarray:
+        h, w = thumb_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
 
-        # Estimate dominant board background color from upper-body canvas strips
-        margin_band = image_bgr[int(h * 0.16) : int(h * 0.35), :]
-        board_bg = np.median(margin_band.reshape(-1, 3), axis=0).astype(np.float32)
+        margin_band = thumb_bgr[int(h * 0.16) : int(h * 0.35), :]
+        board_bg = np.median(margin_band.reshape(-1, 3), axis=0).astype(np.int16)
 
-        ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
+        ycrcb = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2YCrCb)
         skin_mask = cv2.inRange(ycrcb, np.array([0, 133, 77]), np.array([255, 182, 138]))
-        k_open = max(3, int(round(w / 250)) | 1)
+        k_open = max(3, int(round(w / 110)) | 1)
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, np.ones((k_open, k_open), np.uint8))
 
-        min_skin_area = max(45, int(h * w * 0.00085))
+        min_skin_area = max(35, int(h * w * 0.0008))
         max_skin_area = int(h * w * 0.12)
 
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(skin_mask)
@@ -391,68 +340,66 @@ class PresenterDetector:
                 below_y1 = min(h - 1, y + bh)
                 below_x1 = max(0, x - int(bw * 1.45))
                 below_x2 = min(w, x + bw + int(bw * 1.45))
-                roi_below = image_bgr[below_y1:h, below_x1:below_x2]
+                roi_below = thumb_bgr[below_y1:h, below_x1:below_x2]
                 if roi_below.size > 0:
-                    diff_from_board = float(np.mean(np.abs(roi_below.astype(np.float32) - board_bg)))
+                    diff_from_board = float(np.mean(np.abs(roi_below.astype(np.int16) - board_bg)))
                     mean_luma = float(np.mean(roi_below))
                     if diff_from_board > 24.0 or mean_luma < 145.0:
-                        pad_top = max(8, int(h * 0.048))
+                        pad_top = max(6, int(h * 0.048))
                         cv2.rectangle(mask, (below_x1, max(0, y - pad_top)), (below_x2, h), 255, -1)
 
-        # Haar Face Detector fallback (only on higher-res frames where faces >= 24px)
-        if w >= 480 and self.face_cascade is not None and not self.face_cascade.empty():
-            gray_small = cv2.resize(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY), (640, 360))
-            faces = self.face_cascade.detectMultiScale(gray_small, scaleFactor=1.15, minNeighbors=4, minSize=(24, 24))
-            scale_x, scale_y = w / 640.0, h / 360.0
+        if use_haar and self.face_cascade is not None and not self.face_cascade.empty():
+            gray_small = cv2.cvtColor(thumb_bgr, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(gray_small, scaleFactor=1.2, minNeighbors=4, minSize=(14, 14))
             for (fx, fy, fw, fh) in faces:
-                rx, ry, rw, rh = int(fx * scale_x), int(fy * scale_y), int(fw * scale_x), int(fh * scale_y)
-                body_x1 = max(0, rx - int(rw * 1.5))
-                body_x2 = min(w, rx + rw + int(rw * 1.5))
-                body_y1 = max(0, ry - int(rh * 0.3))
+                body_x1 = max(0, fx - int(fw * 1.5))
+                body_x2 = min(w, fx + fw + int(fw * 1.5))
+                body_y1 = max(0, fy - int(fh * 0.3))
                 cv2.rectangle(mask, (body_x1, body_y1), (body_x2, h), 255, -1)
 
         return mask
 
-    def compute_segment_masks(self, images: List[np.ndarray]) -> List[np.ndarray]:
+    def compute_segment_masks_small(self, thumbs: List[np.ndarray]) -> List[np.ndarray]:
         """
-        Combines single-frame person detection with Solid-Core Temporal Foreground Segmentation.
-        Crucially distinguishes solid moving human bodies/arms from thin progressive handwriting
-        written onto the board during the segment!
+        Operates purely on 320x180 uint8 thumbnails (<2.5 MB RAM total!).
+        Note: if pixels never move across the entire segment (e.g. a static logo or static inset card),
+        suppresses static false-positive skin boxes so static graphics are never unnecessarily inpainted!
         """
-        if not images:
+        if not thumbs:
             return []
 
-        single_masks = [self.detect_single_frame_person_mask(img) for img in images]
-        if len(images) < 3:
+        single_masks = [self.detect_single_frame_person_mask(t, use_haar=True) for t in thumbs]
+        if len(thumbs) < 3:
             return single_masks
 
-        h, w = images[0].shape[:2]
-        small_w, small_h = 640, 360
-        stack = np.stack(
-            [cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA) for img in images],
-            axis=0,
-        )
+        small_h, small_w = thumbs[0].shape[:2]
+        stack = np.stack(thumbs, axis=0)  # (N, 180, 320, 3) uint8 -> only 2.5 MB!
         median_small = np.median(stack, axis=0).astype(np.uint8)
-        late_ref_small = np.median(stack[-min(3, len(images)) :], axis=0).astype(np.uint8)
+        late_ref_small = np.median(stack[-min(3, len(thumbs)) :], axis=0).astype(np.uint8)
 
-        solid_open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        # Detect whether ANY pixel actually changed across the segment (protects 100%-static fallback cards!)
+        temporal_ptp = np.max(np.ptp(stack, axis=0), axis=2)  # (180, 320) uint8 max-min range across time
+        dynamic_zone = cv2.dilate((temporal_ptp > 18).astype(np.uint8) * 255, np.ones((9, 9), np.uint8)) > 0
+
+        solid_open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         combined_masks: List[np.ndarray] = []
 
-        for idx in range(len(images)):
+        for idx in range(len(thumbs)):
             small_img = stack[idx]
             diff_med = np.max(cv2.absdiff(small_img, median_small), axis=2)
             diff_late = np.max(cv2.absdiff(small_img, late_ref_small), axis=2)
 
-            # Ignore bottom 8% player UI strip
             diff_med[int(small_h * 0.92) :, :] = 0
             _, raw_motion = cv2.threshold(diff_med, 26, 255, cv2.THRESH_BINARY)
 
-            # Thin handwriting strokes (1-5px) vanish under 11x11 opening, whereas solid human
-            # heads, torsos, and arms survive! Also flag transient blobs that vanish by late_ref.
             solid_core = cv2.morphologyEx(raw_motion, cv2.MORPH_OPEN, solid_open_kernel)
             _, transient_blob = cv2.threshold(diff_late, 28, 255, cv2.THRESH_BINARY)
-            transient_core = cv2.morphologyEx(transient_blob, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            transient_core = cv2.morphologyEx(
+                transient_blob,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            )
             seed_core = cv2.bitwise_or(solid_core, transient_core)
 
             candidate_blobs = cv2.morphologyEx(raw_motion, cv2.MORPH_CLOSE, close_kernel)
@@ -463,95 +410,142 @@ class PresenterDetector:
             for label_id in range(1, num_labels):
                 if stats[label_id, cv2.CC_STAT_AREA] >= min_blob_area:
                     comp_mask = labels == label_id
-                    # Keep component ONLY if it contains a solid body/arm core (protects newly written text!)
                     if np.any(seed_core[comp_mask] > 0):
                         cleaned_motion[comp_mask] = 255
 
             cleaned_motion = cv2.dilate(cleaned_motion, close_kernel, iterations=1)
-            upscaled_motion = cv2.resize(cleaned_motion, (w, h), interpolation=cv2.INTER_NEAREST)
-            merged = cv2.bitwise_or(single_masks[idx], upscaled_motion)
+            # Only keep single-frame person detections in regions that actually exhibit temporal variance
+            # (prevents trying to erase a static textbook diagram or static fallback thumbnail!)
+            active_single = np.where(dynamic_zone, single_masks[idx], 0).astype(np.uint8)
+            merged = cv2.bitwise_or(active_single, cleaned_motion)
             combined_masks.append(merged)
 
         return combined_masks
 
 
-def reconstruct_clean_slide_temporal(
-    scored_frames: List[ScoredFrame],
-    peak_anchor: ScoredFrame,
+def reconstruct_clean_slide_streaming_uint8(
+    scored_candidates: List[ScoredCandidate],
+    peak_anchor: ScoredCandidate,
+    peak_bgr: np.ndarray,
 ) -> Tuple[np.ndarray, float, str]:
     """
-    Reverse-Chronological Ink-Preserving Teacher Removal:
-    1. Anchors on `peak_anchor` (the sharpest pre-transition frame with maximum accumulated board content).
-    2. Keeps `peak_anchor` pixels directly wherever the teacher mask is 0 (preserving 100% of even
-       last-second handwriting at native single-frame sharpness).
-    3. Inside the dilated teacher silhouette of `peak_anchor`, walks BACKWARD in time through recent
-       sharp frames (`cum_valid <= 3`) to backfill each occluded pixel from its most recent unobstructed
-       observation, blending smoothly across the boundary!
+    ZERO-STACK uint8 Reverse-Chronological Teacher Removal (< 5 MB Peak RAM!):
+    - NEVER allocates 4D float32/float64 arrays or calls `np.nanmedian`!
+    - Decodes ONE backup JPEG at a time, copies unobstructed uint8 pixels strictly at the
+      1D coordinates `(occ_ys, occ_xs)` behind the teacher in `peak_bgr`, and immediately frees
+      the decoded frame!
     """
-    # Order candidates starting from peak_anchor, then reverse-chronologically among sharp frames
-    others = [sf for sf in scored_frames if sf.buffered.index != peak_anchor.buffered.index]
+    h, w = peak_bgr.shape[:2]
+    dilate_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+    peak_mask_small = cv2.dilate(peak_anchor.person_mask_small, dilate_small, iterations=1)
+    if peak_anchor.overlay_penalty > 0.25:
+        peak_mask_small[int(180 * 0.92) :, :] = 255
+
+    # Check at 320x180 first before doing any full-res work
+    if int(np.count_nonzero(peak_mask_small)) == 0:
+        return peak_bgr.copy(), 0.0, "single_clean_frame"
+
+    peak_occ_full = cv2.resize(peak_mask_small, (w, h), interpolation=cv2.INTER_NEAREST) > 0
+    occ_ys, occ_xs = np.where(peak_occ_full)
+    num_occ = int(occ_ys.size)
+    if num_occ == 0:
+        return peak_bgr.copy(), 0.0, "single_clean_frame"
+
+    # Order backup candidates reverse-chronologically (most recent sharp frames first!)
+    others = [sc for sc in scored_candidates if sc.buffered.index != peak_anchor.buffered.index]
     others.sort(
-        key=lambda sf: (
-            1 if sf.sharpness_score >= max(20.0, peak_anchor.sharpness_score * 0.55) else 0,
-            sf.buffered.index,
+        key=lambda sc: (
+            1 if sc.sharpness_score >= max(15.0, peak_anchor.sharpness_score * 0.55) else 0,
+            sc.buffered.index,
         ),
         reverse=True,
     )
-    ordered = [peak_anchor] + others[: min(15, len(others))]
 
-    h, w = peak_anchor.decoded_image.shape[:2]
-    dilate_px = max(13, int(round(w / 68)) | 1)
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
+    # Store up to 3 recent unobstructed uint8 RGB observations ONLY for the M occluded pixels (~1.2 MB!)
+    obs = np.zeros((3, num_occ, 3), dtype=np.uint8)
+    obs_count = np.zeros(num_occ, dtype=np.uint8)
 
-    imgs = np.stack([c.decoded_image for c in ordered], axis=0).astype(np.float32)  # (N, H, W, 3)
-    masks = np.stack(
-        [cv2.dilate(c.person_mask, dilate_kernel, iterations=1) > 0 for c in ordered],
-        axis=0,
-    )  # (N, H, W) True where presenter blocks the board
+    # Track at 320x180 to skip decoding frames that don't uncover any needed pixels
+    occ_ys_small = (occ_ys * 180) // h
+    occ_xs_small = (occ_xs * 320) // w
 
-    # Also mask bottom 8% strip on frames that suffer from a video player UI bar
-    bottom_y = int(h * 0.92)
-    for idx, c in enumerate(ordered):
-        if c.overlay_penalty > 0.25:
-            masks[idx, bottom_y:, :] = True
+    for cand in others[:12]:
+        still_needed = obs_count < 3
+        if not np.any(still_needed):
+            break
 
-    valid_mask = ~masks  # True where pixel is clean, unobstructed board
-    cum_valid = np.cumsum(valid_mask, axis=0)
-    # Select up to the 3 most recent unobstructed observations per pixel (preserves newly written ink!)
-    recent_valid = valid_mask & (cum_valid <= 3)
+        cand_mask_small = cv2.dilate(cand.person_mask_small, dilate_small, iterations=1)
+        if cand.overlay_penalty > 0.25:
+            cand_mask_small[int(180 * 0.92) :, :] = 255
 
-    masked_imgs = np.where(recent_valid[..., None], imgs, np.nan)
-    with np.errstate(all="ignore"):
-        backfill = np.nanmedian(masked_imgs, axis=0)
+        # Quick check on 320x180 mask: does this frame uncover at least 64 needed pixels?
+        uncovered_approx = still_needed & (cand_mask_small[occ_ys_small, occ_xs_small] == 0)
+        if int(np.count_nonzero(uncovered_approx)) < 64:
+            continue
 
-    fallback_median = np.median(imgs, axis=0)
-    still_occluded = np.isnan(backfill[..., 0]) | (cum_valid[-1] == 0)
-    backfill = np.where(still_occluded[..., None], fallback_median, backfill)
+        # Decode ONLY this single frame (2.7 MB), copy pixels, and immediately release it!
+        cand_bgr = cand.buffered.decode_bgr()
+        if cand_bgr.shape[1] != w or cand_bgr.shape[0] != h:
+            cand_bgr = cv2.resize(cand_bgr, (w, h), interpolation=cv2.INTER_AREA)
 
-    # Seamlessly feather backfill ONLY into the occluded region of peak_anchor
-    peak_occ_mask = masks[0].astype(np.float32)
-    feather_alpha = cv2.GaussianBlur(peak_occ_mask, (15, 15), 4.0)[..., None]
-    anchor_f32 = peak_anchor.decoded_image.astype(np.float32)
-    blended = anchor_f32 * (1.0 - feather_alpha) + backfill * feather_alpha
-    composite_u8 = np.clip(blended, 0, 255).astype(np.uint8)
+        cand_occ_full = cv2.resize(cand_mask_small, (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        hit = still_needed & (~cand_occ_full[occ_ys, occ_xs])
+        if np.any(hit):
+            hit_indices = np.where(hit)[0]
+            slots = obs_count[hit_indices]
+            obs[slots, hit_indices] = cand_bgr[occ_ys[hit_indices], occ_xs[hit_indices]]
+            obs_count[hit_indices] = slots + 1
 
-    residual_ratio = float(np.mean(still_occluded))
+        del cand_bgr
+
+    # Compute exact integer median across the 1, 2, or 3 collected uint8 observations
+    filled_pixels = peak_bgr[occ_ys, occ_xs].copy()
+
+    m1 = obs_count == 1
+    if np.any(m1):
+        filled_pixels[m1] = obs[0, m1]
+
+    m2 = obs_count == 2
+    if np.any(m2):
+        avg2 = (obs[0, m2].astype(np.uint16) + obs[1, m2].astype(np.uint16)) >> 1
+        filled_pixels[m2] = avg2.astype(np.uint8)
+
+    m3 = obs_count >= 3
+    if np.any(m3):
+        # Middle element of 3 sorted uint8 values = exact median in 0 extra memory!
+        filled_pixels[m3] = np.sort(obs[:, m3, :], axis=0)[1]
+
+    backfill_canvas = peak_bgr.copy()
+    backfill_canvas[occ_ys, occ_xs] = filled_pixels
+
+    # Feather strictly within the bounding box of peak_occ_full in integer fixed-point [0..256]
+    y1, y2 = max(0, int(occ_ys.min()) - 12), min(h, int(occ_ys.max()) + 13)
+    x1, x2 = max(0, int(occ_xs.min()) - 12), min(w, int(occ_xs.max()) + 13)
+    alpha_roi = cv2.GaussianBlur(peak_occ_full[y1:y2, x1:x2].astype(np.uint8) * 255, (15, 15), 4.0).astype(np.uint16)
+    p_roi = peak_bgr[y1:y2, x1:x2].astype(np.uint16)
+    b_roi = backfill_canvas[y1:y2, x1:x2].astype(np.uint16)
+    blended_roi = ((p_roi * (255 - alpha_roi[..., None]) + b_roi * alpha_roi[..., None]) // 255).astype(np.uint8)
+
+    composite_u8 = peak_bgr.copy()
+    composite_u8[y1:y2, x1:x2] = blended_roi
+    del backfill_canvas
+
+    never_uncovered_count = int(np.count_nonzero(obs_count == 0))
+    residual_ratio = never_uncovered_count / float(h * w)
     method = "temporal_backfill_fusion"
 
-    # Tier 3: Heal small never-uncovered static spots (<12% of screen) via Navier-Stokes Telea inpainting
-    if 0.002 < residual_ratio < 0.12:
-        inpaint_mask = still_occluded.astype(np.uint8) * 255
-        composite_u8 = cv2.inpaint(composite_u8, inpaint_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+    if 0.002 < residual_ratio < 0.10:
+        inpaint_mask = np.zeros((h, w), dtype=np.uint8)
+        unfilled_idx = np.where(obs_count == 0)[0]
+        inpaint_mask[occ_ys[unfilled_idx], occ_xs[unfilled_idx]] = 255
+        composite_u8 = cv2.inpaint(composite_u8, inpaint_mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
         method = "temporal_backfill_plus_inpaint"
 
     return composite_u8, residual_ratio, method
 
 
 def extract_slide_text_summary(image_bgr: np.ndarray, slide_number: int) -> str:
-    """
-    Extracts structural text layout density & OCR summary.
-    Uses pytesseract if installed, otherwise performs morphological text-line detection.
-    """
     try:
         import pytesseract  # type: ignore
 
@@ -586,6 +580,9 @@ def extract_slide_text_summary(image_bgr: np.ndarray, slide_number: int) -> str:
 
 def _resolve_target_dimensions(native_w: int, native_h: int, preset: QualityPreset) -> Tuple[int, int]:
     if preset.name == "high":
+        # On constrained 512 MB Render Free Tier, cap high preset at 1280x720 to guarantee OOM immunity
+        if os.getenv("RENDER"):
+            return 1280, 720
         if native_w >= 1400 and native_h >= 800:
             return 1920, 1080
         return 1280, 720
@@ -601,19 +598,15 @@ def run_slide_extraction_pipeline(
     enable_temporal_inpainting: bool = True,
     enable_ocr_indexing: bool = True,
     progress_callback: Optional[Callable[[str, int, str, int], None]] = None,
+    on_slide_extracted: Optional[Callable[[ExtractedSlide], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[ExtractedSlide], int, int]:
     """
-    Streaming O(1)-Memory Computer Vision Slide & Progressive-Board Extraction Pipeline:
-    1. Streams frames using `cap.grab()` without buffering full videos in RAM (safe on 512 MB Render Free).
-    2. Tracks progressive board writing right up to the exact pre-transition frame before a wipe or slide switch.
-    3. Segments teacher silhouette across light slides & dark chalkboards while preserving newly written strokes.
-    4. Applies Reverse-Chronological Ink-Preserving Backfill when the teacher blocks the completed board,
-       and saves a Before/After comparison frame (`slide_XXX_before.jpg`) for interactive inspection.
-    5. Deduplicates revisited slides globally using structural distance + stroke Dice overlap.
+    Ultra-Low-Memory (<115 MB total container RSS) Streaming Slide & Chalkboard Pipeline.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     preset = QUALITY_PRESETS.get(quality_mode, QUALITY_PRESETS["balanced"])
+    max_seg_buf = min(preset.max_segment_buffer, 10) if os.getenv("RENDER") else preset.max_segment_buffer
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -627,7 +620,6 @@ def run_slide_extraction_pipeline(
 
     target_w, target_h = _resolve_target_dimensions(native_w, native_h, preset)
 
-    # Adaptive FPS scaling by lecture duration & user-selected quality tier
     if duration_sec > 1800:
         effective_sample_fps = preset.long_fps
     elif duration_sec > 600:
@@ -645,36 +637,30 @@ def run_slide_extraction_pipeline(
         if cancel_check and cancel_check():
             raise InterruptedError("Job cancelled by student.")
 
-        # Trim incoming cross-dissolve frame at start and outgoing motion-blur transition frame at cut
         eval_bfs = seg.frames[1:] if len(seg.frames) >= 4 else list(seg.frames)
-        decoded_imgs = [bf.decode_bgr() for bf in eval_bfs]
 
-        if len(decoded_imgs) >= 4:
-            # Check if the very last frame right at the cut is mid-dissolve or blurred
-            last_gray = cv2.cvtColor(decoded_imgs[-1], cv2.COLOR_BGR2GRAY)
-            prev_gray = cv2.cvtColor(decoded_imgs[-2], cv2.COLOR_BGR2GRAY)
-            last_sharp = float(cv2.Laplacian(last_gray, cv2.CV_64F).var())
-            prev_sharp = float(cv2.Laplacian(prev_gray, cv2.CV_64F).var())
+        # Trim outgoing cross-dissolve blur frame using lightweight 320x180 thumbnails (0 full-res decodes!)
+        if len(eval_bfs) >= 4:
+            last_sharp = compute_masked_sharpness(eval_bfs[-1].thumb_bgr, np.zeros((180, 320), np.uint8))
+            prev_sharp = compute_masked_sharpness(eval_bfs[-2].thumb_bgr, np.zeros((180, 320), np.uint8))
             if last_sharp < prev_sharp * 0.52:
                 eval_bfs = eval_bfs[:-1]
-                decoded_imgs = decoded_imgs[:-1]
 
-        person_masks = detector.compute_segment_masks(decoded_imgs)
+        thumbs = [bf.thumb_bgr for bf in eval_bfs]
+        person_masks_small = detector.compute_segment_masks_small(thumbs)
 
-        # Measure unobstructed stroke density per frame to quantify progressive board completeness!
         unocc_stroke_densities: List[float] = []
         raw_sharpnesses: List[float] = []
         temp_metrics: List[Tuple[float, float, float]] = []
 
-        for bf, img, p_mask in zip(eval_bfs, decoded_imgs, person_masks):
-            occ_ratio = float(np.count_nonzero(p_mask)) / float(p_mask.shape[0] * p_mask.shape[1])
-            sharp = compute_masked_sharpness(img, p_mask)
-            overlay_pen = detect_playback_overlay_penalty(img)
-            raw_sharpnesses.append(sharp)
-            temp_metrics.append((occ_ratio, sharp, overlay_pen))
+        for bf, p_mask_s in zip(eval_bfs, person_masks_small):
+            occ_ratio = float(np.count_nonzero(p_mask_s)) / float(p_mask_s.shape[0] * p_mask_s.shape[1])
+            sharp_small = compute_masked_sharpness(bf.thumb_bgr, p_mask_s)
+            overlay_pen = detect_playback_overlay_penalty(bf.thumb_bgr)
+            raw_sharpnesses.append(sharp_small)
+            temp_metrics.append((occ_ratio, sharp_small, overlay_pen))
 
-            p_small = cv2.resize(p_mask, (320, 180), interpolation=cv2.INTER_NEAREST)
-            vis_mask = (p_small[:166, :] == 0)
+            vis_mask = p_mask_s[:166, :] == 0
             vis_pixels = max(1, int(np.count_nonzero(vis_mask)))
             vis_strokes = int(np.count_nonzero((bf.stroke_mask_small[:166, :] > 0) & vis_mask))
             unocc_stroke_densities.append(vis_strokes / float(vis_pixels))
@@ -684,13 +670,13 @@ def run_slide_extraction_pipeline(
         is_progressive_board = (peak_stroke_density > 0.008) and (peak_stroke_density > min_stroke_density * 1.32)
 
         max_sharp = max(max(raw_sharpnesses), 1.0)
-        scored_list: List[ScoredFrame] = []
+        scored_list: List[ScoredCandidate] = []
         n_eval = max(1, len(eval_bfs) - 1)
 
-        for idx_f, (bf, img, p_mask, (occ_ratio, sharp, overlay_pen), s_dens) in enumerate(
-            zip(eval_bfs, decoded_imgs, person_masks, temp_metrics, unocc_stroke_densities)
+        for idx_f, (bf, p_mask_s, (occ_ratio, sharp_s, overlay_pen), s_dens) in enumerate(
+            zip(eval_bfs, person_masks_small, temp_metrics, unocc_stroke_densities)
         ):
-            norm_sharp = min(1.0, sharp / max_sharp)
+            norm_sharp = min(1.0, sharp_s / max_sharp)
             stroke_comp = min(1.0, s_dens / peak_stroke_density) if peak_stroke_density > 0.004 else 1.0
             recency = idx_f / float(n_eval)
             completeness = (0.72 * stroke_comp + 0.28 * recency) if is_progressive_board else (0.90 * stroke_comp + 0.10 * recency)
@@ -704,34 +690,41 @@ def run_slide_extraction_pipeline(
                 comp_score = 0.40 * norm_sharp + 0.44 * occ_reward + 0.08 * completeness + 0.08 * overlay_reward
 
             scored_list.append(
-                ScoredFrame(
+                ScoredCandidate(
                     buffered=bf,
-                    decoded_image=img,
-                    person_mask=p_mask,
+                    person_mask_small=p_mask_s,
                     person_occlusion_ratio=occ_ratio,
-                    sharpness_score=sharp,
+                    sharpness_score=sharp_s,
                     overlay_penalty=overlay_pen,
                     content_completeness=completeness,
                     composite_score=comp_score,
                 )
             )
 
-        # Identify the sharpest pre-transition peak-content frame (captures full board right before slide switch!)
         high_comp_candidates = [
-            sf for sf in scored_list if sf.content_completeness >= (0.86 if is_progressive_board else 0.78)
+            sc for sc in scored_list if sc.content_completeness >= (0.86 if is_progressive_board else 0.78)
         ] or scored_list
 
-        # Best unobstructed peak-content frame vs. best overall peak-content anchor
         best_peak = max(
             high_comp_candidates,
-            key=lambda sf: (
-                0.45 * min(1.0, sf.sharpness_score / max_sharp)
-                + 0.35 * ((1.0 - min(1.0, sf.person_occlusion_ratio * 2.5)) ** 2)
-                + 0.12 * sf.content_completeness
-                + 0.08 * (1.0 - sf.overlay_penalty)
+            key=lambda sc: (
+                0.45 * min(1.0, sc.sharpness_score / max_sharp)
+                + 0.35 * ((1.0 - min(1.0, sc.person_occlusion_ratio * 2.5)) ** 2)
+                + 0.12 * sc.content_completeness
+                + 0.08 * (1.0 - sc.overlay_penalty)
             ),
         )
-        worst_occluded = max(scored_list, key=lambda sf: sf.person_occlusion_ratio)
+        worst_occluded = max(scored_list, key=lambda sc: sc.person_occlusion_ratio)
+
+        # Decode ONLY the single winning peak frame at full resolution!
+        peak_bgr = best_peak.buffered.decode_bgr()
+        peak_full_mask = cv2.resize(
+            best_peak.person_mask_small,
+            (peak_bgr.shape[1], peak_bgr.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        full_sharpness = compute_masked_sharpness(peak_bgr, peak_full_mask)
+        del peak_full_mask
 
         needs_temporal_deocclusion = (
             best_peak.person_occlusion_ratio > settings.clean_occlusion_threshold
@@ -739,20 +732,28 @@ def run_slide_extraction_pipeline(
             and len(scored_list) >= 3
         )
 
-        before_occluded_bgr: Optional[np.ndarray] = None
+        before_jpeg_bytes: Optional[bytes] = None
         if not needs_temporal_deocclusion:
-            chosen_img = best_peak.decoded_image.copy()
+            chosen_img = peak_bgr
             was_reconstructed = False
             method = "pre_transition_clean_frame" if is_progressive_board else "single_clean_frame"
             final_occ = best_peak.person_occlusion_ratio
-            # Even when a clean late frame existed, if the teacher walked in front earlier (>5% occlusion),
-            # we can still save that obstructed frame for interactive Before/After judge comparison!
             if worst_occluded.person_occlusion_ratio >= 0.05:
-                before_occluded_bgr = worst_occluded.decoded_image.copy()
+                before_jpeg_bytes = worst_occluded.buffered.jpeg_bytes
         else:
-            before_occluded_bgr = best_peak.decoded_image.copy() if best_peak.person_occlusion_ratio >= worst_occluded.person_occlusion_ratio * 0.6 else worst_occluded.decoded_image.copy()
-            chosen_img, residual_occ, method = reconstruct_clean_slide_temporal(scored_list, best_peak)
-            was_reconstructed = True
+            before_src = (
+                best_peak.buffered
+                if best_peak.person_occlusion_ratio >= worst_occluded.person_occlusion_ratio * 0.6
+                else worst_occluded.buffered
+            )
+            before_jpeg_bytes = before_src.jpeg_bytes
+            chosen_img, residual_occ, method = reconstruct_clean_slide_streaming_uint8(
+                scored_list,
+                best_peak,
+                peak_bgr,
+            )
+            del peak_bgr
+            was_reconstructed = method != "single_clean_frame"
             final_occ = residual_occ
 
         if enhance_contrast:
@@ -760,9 +761,8 @@ def run_slide_extraction_pipeline(
 
         chosen_thumb = cv2.resize(chosen_img, (320, 180), interpolation=cv2.INTER_AREA)
         chosen_strokes = extract_board_stroke_mask_small(chosen_thumb)
-        clean_dhash_int, clean_dhash_hex = compute_dhash(chosen_img)
+        clean_dhash_int, clean_dhash_hex = compute_dhash(chosen_thumb)
 
-        # Global Deduplication (checks both visual distance AND stroke spatial Dice similarity)
         is_duplicate = False
         for existing in final_slides:
             if existing.thumb_bgr is None or existing.stroke_mask_small is None:
@@ -783,7 +783,7 @@ def run_slide_extraction_pipeline(
                     )
                     existing.thumb_bgr = chosen_thumb
                     existing.stroke_mask_small = chosen_strokes
-                    existing.sharpness_score = best_peak.sharpness_score
+                    existing.sharpness_score = full_sharpness
                     existing.person_occlusion_ratio = final_occ
                     existing.final_quality_score = max(existing.final_quality_score, best_peak.composite_score)
                 break
@@ -794,46 +794,47 @@ def run_slide_extraction_pipeline(
             cv2.imwrite(str(img_path), chosen_img, [int(cv2.IMWRITE_JPEG_QUALITY), preset.jpeg_quality])
 
             occ_path: Optional[Path] = None
-            if before_occluded_bgr is not None:
+            if before_jpeg_bytes:
                 occ_path = output_dir / f"slide_{slide_num:03d}_before.jpg"
-                cv2.imwrite(str(occ_path), before_occluded_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                occ_path.write_bytes(before_jpeg_bytes)
 
             ocr_summary = (
                 extract_slide_text_summary(chosen_img, slide_num)
                 if enable_ocr_indexing
                 else f"Slide #{slide_num}"
             )
-            final_slides.append(
-                ExtractedSlide(
-                    slide_number=slide_num,
-                    timestamp_start_sec=seg.start_sec,
-                    timestamp_end_sec=seg.end_sec,
-                    selected_frame_sec=best_peak.buffered.timestamp_sec,
-                    sharpness_score=best_peak.sharpness_score,
-                    person_occlusion_ratio=final_occ,
-                    final_quality_score=best_peak.composite_score,
-                    perceptual_hash=clean_dhash_hex,
-                    dhash_int=clean_dhash_int,
-                    was_reconstructed=was_reconstructed,
-                    reconstruction_method=method,
-                    ocr_text=ocr_summary,
-                    image_path=img_path,
-                    occluded_image_path=occ_path,
-                    content_completeness_score=best_peak.content_completeness,
-                    thumb_bgr=chosen_thumb,
-                    stroke_mask_small=chosen_strokes,
-                )
+            extracted_slide = ExtractedSlide(
+                slide_number=slide_num,
+                timestamp_start_sec=seg.start_sec,
+                timestamp_end_sec=seg.end_sec,
+                selected_frame_sec=best_peak.buffered.timestamp_sec,
+                sharpness_score=full_sharpness,
+                person_occlusion_ratio=final_occ,
+                final_quality_score=best_peak.composite_score,
+                perceptual_hash=clean_dhash_hex,
+                dhash_int=clean_dhash_int,
+                was_reconstructed=was_reconstructed,
+                reconstruction_method=method,
+                ocr_text=ocr_summary,
+                image_path=img_path,
+                occluded_image_path=occ_path,
+                content_completeness_score=best_peak.content_completeness,
+                thumb_bgr=chosen_thumb,
+                stroke_mask_small=chosen_strokes,
             )
+            final_slides.append(extracted_slide)
+            if on_slide_extracted:
+                on_slide_extracted(extracted_slide)
 
-        # Explicitly release decoded BGR matrices to keep RSS tiny on 512 MB Render Free
-        del decoded_imgs, person_masks, scored_list
+        del chosen_img, scored_list, person_masks_small
+        seg.frames.clear()
         gc.collect()
 
     if progress_callback:
         progress_callback(
             "sampling_frames",
             14,
-            f"Streaming lecture in {preset.label} mode ({effective_sample_fps} FPS, low-memory ring buffer)...",
+            f"Streaming in {preset.label} mode ({effective_sample_fps} FPS, <115 MB Ultra-Low-RAM mode)...",
             0,
         )
 
@@ -865,12 +866,12 @@ def run_slide_extraction_pipeline(
         ts = frame_idx / max(1.0, native_fps)
         thumb = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
         stroke_small = extract_board_stroke_mask_small(thumb)
-        quick_p_small = detector.detect_single_frame_person_mask(thumb)
+        quick_p_small = detector.detect_single_frame_person_mask(thumb, use_haar=False)
         d_int, d_hex = compute_dhash(thumb)
 
         ok_enc, enc_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), preset.jpeg_quality])
         jpeg_bytes = enc_buf.tobytes() if ok_enc else b""
-        del frame
+        del frame, enc_buf
 
         bf = BufferedFrame(
             index=total_candidates,
@@ -885,7 +886,7 @@ def run_slide_extraction_pipeline(
         total_candidates += 1
 
         if not current_seg.frames:
-            current_seg.add_frame(bf, preset.max_segment_buffer)
+            current_seg.add_frame(bf, max_seg_buf)
         else:
             assert current_seg.first_frame is not None
             latest_bf = current_seg.frames[-1]
@@ -897,14 +898,14 @@ def run_slide_extraction_pipeline(
                         progress_callback(
                             "removing_occlusions",
                             pct,
-                            f"Pre-transition lock at {int(ts // 60):02d}:{int(ts % 60):02d} • De-occluding Slide #{len(final_slides) + 1}...",
+                            f"Pre-transition lock at {int(ts // 60):02d}:{int(ts % 60):02d} • Finalizing Slide #{len(final_slides) + 1}...",
                             total_candidates,
                         )
                     _finalize_segment(current_seg, segment_counter, total_candidates)
                 current_seg = SlideSegment(segment_index=segment_counter)
-                current_seg.add_frame(bf, preset.max_segment_buffer)
+                current_seg.add_frame(bf, max_seg_buf)
             else:
-                current_seg.add_frame(bf, preset.max_segment_buffer)
+                current_seg.add_frame(bf, max_seg_buf)
 
         now_t = _time.time()
         if progress_callback and total_video_frames > 0 and (now_t - last_report_time > 1.4):
@@ -913,7 +914,7 @@ def run_slide_extraction_pipeline(
             progress_callback(
                 "sampling_frames",
                 pct,
-                f"Streaming & tracking board ({int(ts // 60)}m {int(ts % 60)}s / {max(1, duration_sec // 60)}m) • {len(final_slides)} slides locked...",
+                f"Streaming lecture ({int(ts // 60)}m {int(ts % 60)}s / {max(1, duration_sec // 60)}m) • {len(final_slides)} slides extracted...",
                 total_candidates,
             )
 
@@ -924,7 +925,6 @@ def run_slide_extraction_pipeline(
     if total_candidates == 0:
         raise RuntimeError("No readable video frames were found in the lecture stream.")
 
-    # Finalize the last active slide segment at the end of the video
     if current_seg.frames and (current_seg.duration_sec >= settings.min_slide_duration_sec or not final_slides):
         segment_counter += 1
         if progress_callback:

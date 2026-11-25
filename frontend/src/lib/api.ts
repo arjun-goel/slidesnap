@@ -158,9 +158,17 @@ export function uploadVideoJobWithProgress(params: {
   });
 }
 
+export class JobNotFoundError extends Error {
+  constructor(jobId: string) {
+    super(`Job ${jobId} was cleared or the cloud worker restarted.`);
+    this.name = "JobNotFoundError";
+  }
+}
+
 export async function fetchJob(jobId: string): Promise<JobResponse> {
   const base = getBackendBaseUrl();
   const res = await fetch(`${base}/api/jobs/${jobId}`, { cache: "no-store" });
+  if (res.status === 404) throw new JobNotFoundError(jobId);
   if (!res.ok) throw new Error(`Job lookup failed (${res.status})`);
   return (await res.json()) as JobResponse;
 }

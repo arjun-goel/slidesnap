@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import {
   DEFAULT_BACKEND_URL,
+  JobNotFoundError,
   buildYouTubeTimestampUrl,
   cancelJob,
   checkBackendHealth,
@@ -220,7 +221,23 @@ export default function SlideSnapStudioPage() {
             .then((list) => !cancelled && setJobHistory(list))
             .catch(() => {});
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof JobNotFoundError) {
+          if (!cancelled) {
+            setActiveJob((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    status: "failed",
+                    error_message:
+                      "Cloud container restarted (new deploy or memory reset). Please re-submit with Turbo 480p or Balanced HD.",
+                  }
+                : null
+            );
+            setActiveJobId(null);
+          }
+          return;
+        }
         if (!cancelled) timer = setTimeout(poll, 2200);
       }
     };
