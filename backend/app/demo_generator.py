@@ -381,3 +381,128 @@ def generate_synthetic_lecture_video(output_path: Path) -> Tuple[str, int]:
     writer.release()
     duration_sec = int(round(total_frames / fps))
     return "CS-401 Deep Learning Lecture: Neural Networks, Backprop & Transformers (Demo)", duration_sec
+
+
+def generate_progressive_board_lecture_video(output_path: Path) -> Tuple[str, int]:
+    """
+    Generates a progressive chalkboard/whiteboard benchmark video where:
+    - Board 1 (Dark Green Chalkboard, 0.0s - 6.0s):
+      * 0.0s - 2.0s: Teacher writes Step 1 equation on upper-left (teacher off-screen)
+      * 2.0s - 4.0s: Teacher writes Step 2 integral on middle-left while walking in
+      * 4.0s - 6.0s: Teacher writes final Step 3 boxed theorem on right right before board wipe,
+        WHILE teacher's body stands directly over Step 1 & Step 2!
+    - Board 2 (Clean Summary Slide, 6.0s - 9.0s): Sudden board wipe / slide transition.
+    Tests that SlideSnap:
+      1. Does NOT split Board 1 into 3 partial slides as chalk accumulates.
+      2. Captures Step 3 written right before the 6.0s transition.
+      3. Simultaneously erases the teacher's body from Step 1 & Step 2 via reverse-chronological backfill!
+    """
+    width, height = 1280, 720
+    fps = 10
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+    # Dark green university chalkboard background
+    board_bg = np.full((height, width, 3), (42, 68, 46), dtype=np.uint8)
+    cv2.rectangle(board_bg, (0, 0), (width, 96), (28, 48, 32), -1)
+    cv2.putText(
+        board_bg,
+        "MATH-302 Chalkboard Derivation: Fundamental Theorem & Residue Proof",
+        (42, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.88,
+        (238, 246, 238),
+        2,
+        cv2.LINE_AA,
+    )
+
+    for f in range(60):  # 6.0 seconds progressive chalkboard
+        canvas = board_bg.copy()
+        # Step 1 present from t = 0.0s (x = 70..560, y = 180..290)
+        cv2.putText(
+            canvas,
+            "Step 1: Let f(z) = P(z) / Q(z) on contour C",
+            (70, 210),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (245, 248, 240),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "oint_C f(z) dz = 2 * pi * i * sum(Res(f, z_k))",
+            (70, 270),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (245, 248, 240),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Step 2 written at t >= 2.0s (f >= 20) (x = 70..600, y = 360..460)
+        if f >= 20:
+            cv2.putText(
+                canvas,
+                "Step 2: Evaluate pole at z_0 = i (order 1):",
+                (70, 385),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.72,
+                (245, 250, 210),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                "Res(f, i) = lim_{z->i} (z - i) * f(z) = 1 / (2i)",
+                (70, 445),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.72,
+                (245, 250, 210),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Step 3 written right before slide switch at t >= 4.0s (f >= 40) on right half (x = 680..1210)
+        if f >= 40:
+            cv2.rectangle(canvas, (680, 210), (1210, 470), (240, 245, 190), 3)
+            cv2.putText(
+                canvas,
+                "FINAL RESULT (Pre-Transition):",
+                (710, 275),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.78,
+                (255, 255, 220),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                "Integral I = pi   [Q.E.D.]",
+                (710, 365),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Teacher movement:
+        # f < 16: teacher off-screen so Step 1 is clearly visible
+        # 16 <= f < 36: teacher stands on right side (x=900) while Step 2 is visible on left
+        # f >= 40 (when Step 3 is finally completed!): teacher stands directly at x=310 blocking Step 1 & Step 2!
+        if 18 <= f < 36:
+            canvas = _draw_presenter(canvas, 920, pointing=False)
+        elif f >= 40:
+            canvas = _draw_presenter(canvas, 310, pointing=True)
+
+        writer.write(canvas)
+
+    # Board 2: Clean Slide after Chalkboard Wipe (6.0s - 9.0s)
+    slide2 = _render_base_slide(3, SLIDE_CONTENTS[3], width, height)
+    for _ in range(30):
+        writer.write(slide2)
+
+    writer.release()
+    return "MATH-302 Progressive Chalkboard Derivation Benchmark", 9
+

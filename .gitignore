@@ -1,25 +1,32 @@
-# Python & Virtual Environments
-.venv/
-venv/
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+venv/
 .pytest_cache/
 
-# Runtime Storage & Databases (Do not commit temporary student jobs)
+# SlideSnap runtime storage & SQLite DB
 backend/storage/
 storage/
 *.db
-*.sqlite3
+*.db-journal
 
-# Environment secrets
+# Next.js / Node / Vercel Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+.vercel/
+node_modules/
+
+# Secrets & Environment
 .env
 .env.*
 !.env.example
+!frontend/.env.production
 
-# OS & Tunnel Binaries
+# OS & Binaries
 .DS_Store
 Thumbs.db
 cloudflared.exe
 *.exe
-

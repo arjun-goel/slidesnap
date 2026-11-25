@@ -22,6 +22,13 @@ class SourceType(str, Enum):
     YOUTUBE = "youtube"
     DIRECT_UPLOAD = "direct_upload"
     DEMO_LECTURE = "demo_lecture"
+    PROGRESSIVE_BOARD_DEMO = "progressive_board_demo"
+
+
+class QualityMode(str, Enum):
+    FAST = "fast"
+    BALANCED = "balanced"
+    HIGH = "high"
 
 
 YOUTUBE_REGEX = re.compile(
@@ -35,13 +42,21 @@ class CreateJobRequest(BaseModel):
         default=None,
         description="Valid YouTube lecture URL (required when source_type='youtube')",
     )
+    quality_mode: QualityMode = Field(
+        default=QualityMode.BALANCED,
+        description="Processing quality & speed preset: 'fast' (480p), 'balanced' (720p), or 'high' (1080p).",
+    )
+    enhance_contrast: bool = Field(
+        default=False,
+        description="Apply adaptive CLAHE + unsharp text enhancement for faint chalkboards/projectors.",
+    )
     rights_attested: bool = Field(
         ...,
         description="Student attestation that they own the video or have rights/permission to extract study slides.",
     )
     enable_temporal_inpainting: bool = Field(
         default=True,
-        description="Enable multi-frame temporal composite when the presenter obstructs all frames of a slide.",
+        description="Enable multi-frame temporal composite when the presenter obstructs frames of a slide.",
     )
     enable_ocr_indexing: bool = Field(
         default=True,
@@ -80,11 +95,13 @@ class SlideMetadataResponse(BaseModel):
     sharpness_score: float
     person_occlusion_ratio: float
     final_quality_score: float
+    content_completeness_score: float = 1.0
     perceptual_hash: str
     was_reconstructed: bool
     reconstruction_method: str
     ocr_text: str
     image_url: str
+    occluded_image_url: Optional[str] = None
 
 
 class JobResponse(BaseModel):
@@ -93,6 +110,9 @@ class JobResponse(BaseModel):
     source_url: Optional[str]
     video_title: str
     video_duration_sec: int
+    quality_mode: QualityMode = QualityMode.BALANCED
+    enhance_contrast: bool = False
+    used_youtube_fallback: bool = False
     rights_attested: bool
     enable_temporal_inpainting: bool
     enable_ocr_indexing: bool
@@ -103,6 +123,8 @@ class JobResponse(BaseModel):
     extracted_slide_count: int
     reconstructed_slide_count: int
     pdf_download_url: Optional[str]
+    markdown_download_url: Optional[str] = None
+    zip_download_url: Optional[str] = None
     pdf_file_size_bytes: Optional[int]
     error_code: Optional[str]
     error_message: Optional[str]

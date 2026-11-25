@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import gc
 from pathlib import Path
-from typing import Tuple
 import shutil
 import tempfile
 import threading
 import time
-import cv2
+from typing import Tuple
 
-from .config import settings
+from .config import QUALITY_PRESETS, settings
 from .cv_pipeline import run_slide_extraction_pipeline
 from .database import (
     clear_job_slides,
@@ -20,7 +20,10 @@ from .database import (
     is_cancel_requested,
     update_job_progress,
 )
-from .demo_generator import generate_synthetic_lecture_video
+from .demo_generator import (
+    generate_progressive_board_lecture_video,
+    generate_synthetic_lecture_video,
+)
 from .models import JobStatus, SourceType
 from .pdf_generator import compile_lecture_pdf
 
@@ -35,18 +38,45 @@ class PolicyOrIngestionError(Exception):
         self.message = message
 
 
+def _build_youtube_format_selector(quality_mode: str) -> str:
+    preset = QUALITY_PRESETS.get(quality_mode, QUALITY_PRESETS["balanced"])
+    max_h = preset.youtube_max_height
+    if max_h <= 480:
+        return (
+            "135/134/"
+            "bestvideo[height<=480][vcodec^=avc1][ext=mp4]/"
+            "bestvideo[height<=480][ext=mp4]/"
+            "best[height<=480][ext=mp4]/"
+            "bestvideo[height<=480]/best[height<=480]/best"
+        )
+    if max_h >= 1080:
+        return (
+            "137/136/135/"
+            "bestvideo[height<=1080][vcodec^=avc1][ext=mp4]/"
+            "bestvideo[height<=1080][ext=mp4]/"
+            "bestvideo[height<=720][vcodec^=avc1][ext=mp4]/"
+            "best[height<=1080][ext=mp4]/"
+            "bestvideo[height<=1080]/best"
+        )
+    return (
+        "136/135/134/"
+        "bestvideo[height<=720][vcodec^=avc1][ext=mp4]/"
+        "bestvideo[height<=720][ext=mp4]/"
+        "best[height<=720][ext=mp4]/"
+        "bestvideo[height<=720]/best[height<=720]/best"
+    )
+
+
 def _ingest_youtube_video(
     url: str,
     scratch_dir: Path,
     custom_title: str | None,
+    quality_mode: str = "balanced",
     job_id: str | None = None,
-) -> Tuple[Path, str, int]:
+) -> Tuple[Path, str, int, bool]:
     """
-    Compliance-first YouTube Lecture Ingestion:
-    1. Checks video metadata without bypassing DRM, age-gates, or private authentication walls.
-    2. Enforces maximum lecture duration limit (`settings.max_video_duration_sec`).
-    3. Downloads video-only DASH MP4 stream (`bestvideo[ext=mp4]`) since SlideSnap only needs visual frames
-       (saving bandwidth and avoiding `Requested format is not available` when YouTube omits combined audio+video streams).
+    Compliance-first YouTube Lecture Ingestion scaled to the chosen Quality Tier.
+    Returns (video_path, title, duration_sec, used_fallback).
     """
     try:
         import yt_dlp  # type: ignore
@@ -57,6 +87,7 @@ def _ingest_youtube_video(
         ) from exc
 
     last_update_time = [0.0]
+    preset = QUALITY_PRESETS.get(quality_mode, QUALITY_PRESETS["balanced"])
 
     def _ydl_progress_hook(d: dict) -> None:
         if not job_id:
@@ -78,30 +109,19 @@ def _ingest_youtube_video(
                 update_job_progress(
                     job_id,
                     progress_pct=pct,
-                    stage_detail=f"Downloading YouTube video-only stream ({mb_done:.1f} / {mb_total:.1f} MB)...",
+                    stage_detail=f"Downloading {preset.label} stream ({mb_done:.1f} / {mb_total:.1f} MB)...",
                 )
 
     output_template = str(scratch_dir / "lecture.%(ext)s")
     ydl_opts = {
-        # Prefer 480p-720p H.264/AVC1 video-only DASH MP4 for fast download and universal OpenCV decoding
-        "format": (
-            "135/136/134/"
-            "bestvideo[height<=480][vcodec^=avc1][ext=mp4]/"
-            "bestvideo[height<=720][vcodec^=avc1][ext=mp4]/"
-            "bestvideo[height<=720][ext=mp4]/"
-            "best[height<=720][ext=mp4]/"
-            "bestvideo[height<=720]/"
-            "best[height<=720]/"
-            "bestvideo/best"
-        ),
-        "concurrent_fragment_downloads": 4,
+        "format": _build_youtube_format_selector(quality_mode),
+        "concurrent_fragment_downloads": 3,
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 25,
         "progress_hooks": [_ydl_progress_hook],
-        # Strictly prohibit bypassing DRM or geo-restrictions
         "allow_unplayable_formats": False,
     }
 
@@ -136,18 +156,16 @@ def _ingest_youtube_video(
         downloaded_files = list(scratch_dir.glob("lecture.*"))
         if not downloaded_files:
             raise PolicyOrIngestionError("DOWNLOAD_EMPTY", "Video stream could not be saved.")
-        return downloaded_files[0], title, duration
+        return downloaded_files[0], title, duration, False
 
     except PolicyOrIngestionError:
         raise
-    except Exception as exc:
-        # Cloud Datacenter Fallback: Use public YouTube oEmbed + multi-snapshot frame synthesizer
-        # so the student ALWAYS receives a clean study PDF even if YouTube rate-limits or blocks the cloud IP!
+    except Exception:
         from .youtube_fallback import synthesize_lecture_from_youtube_metadata
 
         fallback_video = scratch_dir / "lecture_fallback.mp4"
         title, duration = synthesize_lecture_from_youtube_metadata(url, fallback_video, custom_title)
-        return fallback_video, title, duration
+        return fallback_video, title, duration, True
 
 
 def execute_job(job_id: str) -> None:
@@ -163,6 +181,8 @@ def execute_job(job_id: str) -> None:
     source_type = SourceType(raw_job["source_type"])
     source_url = raw_job.get("source_url")
     upload_path_str = raw_job.get("upload_path")
+    quality_mode = str(raw_job.get("quality_mode") or "balanced")
+    enhance_contrast = bool(raw_job.get("enhance_contrast", 0))
     enable_inpainting = bool(raw_job.get("enable_temporal_inpainting", 1))
     enable_ocr = bool(raw_job.get("enable_ocr_indexing", 1))
     initial_title = raw_job.get("video_title") or "Lecture Slides"
@@ -178,13 +198,20 @@ def execute_job(job_id: str) -> None:
                 job_id,
                 status=JobStatus.INGESTING,
                 progress_pct=6,
-                stage_detail="Verifying lecture source & preparing video stream...",
+                stage_detail="Verifying lecture source & preparing low-memory video stream...",
             )
 
+            used_fallback = False
             if source_type == SourceType.DEMO_LECTURE:
                 demo_video_path = scratch_dir / "synthetic_lecture.mp4"
                 video_title, duration_sec = generate_synthetic_lecture_video(demo_video_path)
-                if initial_title and initial_title != "Demo Lecture":
+                if initial_title and initial_title not in ("Demo Lecture", "YouTube Lecture"):
+                    video_title = initial_title
+                video_path = demo_video_path
+            elif source_type == SourceType.PROGRESSIVE_BOARD_DEMO:
+                demo_video_path = scratch_dir / "progressive_chalkboard.mp4"
+                video_title, duration_sec = generate_progressive_board_lecture_video(demo_video_path)
+                if initial_title and initial_title not in ("Progressive Board Demo", "Demo Lecture", "YouTube Lecture"):
                     video_title = initial_title
                 video_path = demo_video_path
             elif source_type == SourceType.DIRECT_UPLOAD:
@@ -196,10 +223,11 @@ def execute_job(job_id: str) -> None:
             else:
                 if not source_url:
                     raise PolicyOrIngestionError("URL_MISSING", "No YouTube URL was provided for this job.")
-                video_path, video_title, duration_sec = _ingest_youtube_video(
+                video_path, video_title, duration_sec, used_fallback = _ingest_youtube_video(
                     source_url,
                     scratch_dir,
                     initial_title if initial_title != "YouTube Lecture" else None,
+                    quality_mode=quality_mode,
                     job_id=job_id,
                 )
 
@@ -207,8 +235,9 @@ def execute_job(job_id: str) -> None:
                 job_id,
                 video_title=video_title,
                 video_duration_sec=duration_sec,
+                used_youtube_fallback=used_fallback,
                 progress_pct=12,
-                stage_detail="Video ingested. Initializing OpenCV frame sampler...",
+                stage_detail="Video ready. Starting streaming Pre-Transition CV Pipeline...",
             )
 
             def _on_progress(stage_name: str, pct: int, detail: str, candidate_frames: int) -> None:
@@ -228,6 +257,8 @@ def execute_job(job_id: str) -> None:
             slides, total_candidates, computed_duration = run_slide_extraction_pipeline(
                 video_path=video_path,
                 output_dir=job_output_dir,
+                quality_mode=quality_mode,
+                enhance_contrast=enhance_contrast,
                 enable_temporal_inpainting=enable_inpainting,
                 enable_ocr_indexing=enable_ocr,
                 progress_callback=_on_progress,
@@ -241,7 +272,7 @@ def execute_job(job_id: str) -> None:
                 job_id,
                 status=JobStatus.COMPILING_PDF,
                 progress_pct=88,
-                stage_detail=f"Compiling {len(slides)} clean slides into high-resolution PDF...",
+                stage_detail=f"Compiling {len(slides)} clean slides into Landscape A4 PDF...",
                 video_duration_sec=duration_sec or computed_duration,
                 total_candidate_frames=total_candidates,
             )
@@ -250,10 +281,7 @@ def execute_job(job_id: str) -> None:
             reconstructed_count = 0
 
             for slide in slides:
-                img_filename = f"slide_{slide.slide_number:03d}.jpg"
-                img_path = job_output_dir / img_filename
-                cv2.imwrite(str(img_path), slide.image, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
-                slide_image_paths.append(img_path)
+                slide_image_paths.append(slide.image_path)
                 if slide.was_reconstructed:
                     reconstructed_count += 1
 
@@ -266,11 +294,13 @@ def execute_job(job_id: str) -> None:
                     sharpness_score=slide.sharpness_score,
                     person_occlusion_ratio=slide.person_occlusion_ratio,
                     final_quality_score=slide.final_quality_score,
+                    content_completeness_score=slide.content_completeness_score,
                     perceptual_hash=slide.perceptual_hash,
                     was_reconstructed=slide.was_reconstructed,
                     reconstruction_method=slide.reconstruction_method,
                     ocr_text=slide.ocr_text,
-                    image_filename=img_filename,
+                    image_filename=slide.image_path.name,
+                    occluded_image_filename=slide.occluded_image_path.name if slide.occluded_image_path else None,
                 )
 
             pdf_filename = f"SlideSnap_{job_id[:8]}.pdf"
@@ -281,18 +311,21 @@ def execute_job(job_id: str) -> None:
                 source_label=source_url or source_type.value,
                 slides=slides,
                 slide_image_paths=slide_image_paths,
+                quality_mode=quality_mode,
             )
 
             update_job_progress(
                 job_id,
                 status=JobStatus.COMPLETED,
                 progress_pct=100,
-                stage_detail=f"Completed! Extracted {len(slides)} clean slides ({reconstructed_count} de-occluded via temporal fusion).",
+                stage_detail=f"Completed! Extracted {len(slides)} clean slides ({reconstructed_count} de-occluded via temporal backfill).",
                 extracted_slide_count=len(slides),
                 reconstructed_slide_count=reconstructed_count,
                 pdf_filename=pdf_filename,
                 pdf_file_size_bytes=pdf_size,
             )
+            del slides
+            gc.collect()
 
     except InterruptedError:
         shutil.rmtree(job_output_dir, ignore_errors=True)
@@ -356,7 +389,7 @@ def start_background_cleanup_daemon() -> None:
                 cleanup_expired_artifacts()
             except Exception:
                 pass
-            time.sleep(1800)  # Run every 30 minutes
+            time.sleep(1800)
 
     t = threading.Thread(target=_loop, daemon=True, name="slidesnap_ttl_cleaner")
     t.start()

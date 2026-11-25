@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .config import settings
-from .models import JobResponse, JobStatus, SlideMetadataResponse, SourceType
+from .models import JobResponse, JobStatus, QualityMode, SlideMetadataResponse, SourceType
 
 _db_lock = threading.Lock()
 
@@ -26,6 +26,12 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     with _db_lock:
         conn = get_connection()
@@ -40,6 +46,9 @@ def init_db() -> None:
                     upload_path TEXT,
                     video_title TEXT NOT NULL,
                     video_duration_sec INTEGER NOT NULL DEFAULT 0,
+                    quality_mode TEXT NOT NULL DEFAULT 'balanced',
+                    enhance_contrast INTEGER NOT NULL DEFAULT 0,
+                    used_youtube_fallback INTEGER NOT NULL DEFAULT 0,
                     rights_attested INTEGER NOT NULL DEFAULT 1,
                     enable_temporal_inpainting INTEGER NOT NULL DEFAULT 1,
                     enable_ocr_indexing INTEGER NOT NULL DEFAULT 1,
@@ -71,11 +80,13 @@ def init_db() -> None:
                     sharpness_score REAL NOT NULL,
                     person_occlusion_ratio REAL NOT NULL,
                     final_quality_score REAL NOT NULL,
+                    content_completeness_score REAL NOT NULL DEFAULT 1.0,
                     perceptual_hash TEXT NOT NULL,
                     was_reconstructed INTEGER NOT NULL DEFAULT 0,
                     reconstruction_method TEXT NOT NULL,
                     ocr_text TEXT NOT NULL DEFAULT '',
                     image_filename TEXT NOT NULL,
+                    occluded_image_filename TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
@@ -84,12 +95,17 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_slides_job ON job_slides(job_id, slide_number ASC);
                 """
             )
+            # Safe forward migrations for existing SQLite databases
+            _ensure_column(conn, "jobs", "quality_mode", "TEXT NOT NULL DEFAULT 'balanced'")
+            _ensure_column(conn, "jobs", "enhance_contrast", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "jobs", "used_youtube_fallback", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "job_slides", "content_completeness_score", "REAL NOT NULL DEFAULT 1.0")
+            _ensure_column(conn, "job_slides", "occluded_image_filename", "TEXT")
             conn.commit()
         finally:
             conn.close()
 
 
-# Ensure tables exist even when imported directly in unit tests
 init_db()
 
 
@@ -114,6 +130,8 @@ def create_job_record(
     source_url: Optional[str],
     upload_path: Optional[str],
     video_title: str,
+    quality_mode: QualityMode = QualityMode.BALANCED,
+    enhance_contrast: bool = False,
     rights_attested: bool,
     enable_temporal_inpainting: bool,
     enable_ocr_indexing: bool,
@@ -128,10 +146,10 @@ def create_job_record(
                 """
                 INSERT INTO jobs (
                     id, client_fingerprint, source_type, source_url, upload_path,
-                    video_title, rights_attested, enable_temporal_inpainting,
-                    enable_ocr_indexing, status, progress_pct, current_stage_detail,
-                    created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    video_title, quality_mode, enhance_contrast, rights_attested,
+                    enable_temporal_inpainting, enable_ocr_indexing, status,
+                    progress_pct, current_stage_detail, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -140,6 +158,8 @@ def create_job_record(
                     source_url,
                     upload_path,
                     video_title,
+                    quality_mode.value,
+                    1 if enhance_contrast else 0,
                     1 if rights_attested else 0,
                     1 if enable_temporal_inpainting else 0,
                     1 if enable_ocr_indexing else 0,
@@ -164,6 +184,7 @@ def update_job_progress(
     stage_detail: Optional[str] = None,
     video_title: Optional[str] = None,
     video_duration_sec: Optional[int] = None,
+    used_youtube_fallback: Optional[bool] = None,
     total_candidate_frames: Optional[int] = None,
     extracted_slide_count: Optional[int] = None,
     reconstructed_slide_count: Optional[int] = None,
@@ -198,6 +219,9 @@ def update_job_progress(
     if video_duration_sec is not None:
         fields.append("video_duration_sec = ?")
         values.append(int(video_duration_sec))
+    if used_youtube_fallback is not None:
+        fields.append("used_youtube_fallback = ?")
+        values.append(1 if used_youtube_fallback else 0)
     if total_candidate_frames is not None:
         fields.append("total_candidate_frames = ?")
         values.append(int(total_candidate_frames))
@@ -243,11 +267,13 @@ def insert_job_slide(
     sharpness_score: float,
     person_occlusion_ratio: float,
     final_quality_score: float,
+    content_completeness_score: float = 1.0,
     perceptual_hash: str,
     was_reconstructed: bool,
     reconstruction_method: str,
     ocr_text: str,
     image_filename: str,
+    occluded_image_filename: Optional[str] = None,
 ) -> str:
     slide_id = str(uuid.uuid4())
     with _db_lock:
@@ -258,9 +284,10 @@ def insert_job_slide(
                 INSERT INTO job_slides (
                     id, job_id, slide_number, timestamp_start_sec, timestamp_end_sec,
                     selected_frame_sec, sharpness_score, person_occlusion_ratio,
-                    final_quality_score, perceptual_hash, was_reconstructed,
-                    reconstruction_method, ocr_text, image_filename, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    final_quality_score, content_completeness_score, perceptual_hash,
+                    was_reconstructed, reconstruction_method, ocr_text,
+                    image_filename, occluded_image_filename, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     slide_id,
@@ -272,11 +299,13 @@ def insert_job_slide(
                     round(sharpness_score, 2),
                     round(person_occlusion_ratio, 4),
                     round(final_quality_score, 4),
+                    round(content_completeness_score, 4),
                     perceptual_hash,
                     1 if was_reconstructed else 0,
                     reconstruction_method,
                     ocr_text,
                     image_filename,
+                    occluded_image_filename,
                     _iso(_utc_now()),
                 ),
             )
@@ -366,34 +395,68 @@ def get_raw_job(job_id: str) -> Optional[Dict[str, Any]]:
             conn.close()
 
 
+def get_raw_job_slides(job_id: str) -> List[Dict[str, Any]]:
+    with _db_lock:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM job_slides WHERE job_id = ? ORDER BY slide_number ASC",
+                (job_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
 def _row_to_job_response(row: sqlite3.Row, slides: List[sqlite3.Row]) -> JobResponse:
     job_id = row["id"]
-    pdf_url = f"/api/jobs/{job_id}/download" if row["pdf_filename"] and row["status"] == JobStatus.COMPLETED.value else None
-    slide_Items = [
-        SlideMetadataResponse(
-            id=s["id"],
-            job_id=job_id,
-            slide_number=s["slide_number"],
-            timestamp_start_sec=s["timestamp_start_sec"],
-            timestamp_end_sec=s["timestamp_end_sec"],
-            selected_frame_sec=s["selected_frame_sec"],
-            sharpness_score=s["sharpness_score"],
-            person_occlusion_ratio=s["person_occlusion_ratio"],
-            final_quality_score=s["final_quality_score"],
-            perceptual_hash=s["perceptual_hash"],
-            was_reconstructed=bool(s["was_reconstructed"]),
-            reconstruction_method=s["reconstruction_method"],
-            ocr_text=s["ocr_text"],
-            image_url=f"/api/jobs/{job_id}/slides/{s['image_filename']}",
+    is_done = bool(row["pdf_filename"] and row["status"] == JobStatus.COMPLETED.value)
+    pdf_url = f"/api/jobs/{job_id}/download" if is_done else None
+    md_url = f"/api/jobs/{job_id}/markdown" if is_done else None
+    zip_url = f"/api/jobs/{job_id}/zip" if is_done else None
+
+    row_keys = set(row.keys())
+    q_mode_raw = row["quality_mode"] if "quality_mode" in row_keys and row["quality_mode"] else "balanced"
+    try:
+        q_mode = QualityMode(q_mode_raw)
+    except ValueError:
+        q_mode = QualityMode.BALANCED
+
+    slide_items: List[SlideMetadataResponse] = []
+    for s in slides:
+        s_keys = set(s.keys())
+        occ_fname = s["occluded_image_filename"] if "occluded_image_filename" in s_keys else None
+        comp_score = float(s["content_completeness_score"]) if "content_completeness_score" in s_keys and s["content_completeness_score"] is not None else 1.0
+        slide_items.append(
+            SlideMetadataResponse(
+                id=s["id"],
+                job_id=job_id,
+                slide_number=s["slide_number"],
+                timestamp_start_sec=s["timestamp_start_sec"],
+                timestamp_end_sec=s["timestamp_end_sec"],
+                selected_frame_sec=s["selected_frame_sec"],
+                sharpness_score=s["sharpness_score"],
+                person_occlusion_ratio=s["person_occlusion_ratio"],
+                final_quality_score=s["final_quality_score"],
+                content_completeness_score=comp_score,
+                perceptual_hash=s["perceptual_hash"],
+                was_reconstructed=bool(s["was_reconstructed"]),
+                reconstruction_method=s["reconstruction_method"],
+                ocr_text=s["ocr_text"],
+                image_url=f"/api/jobs/{job_id}/slides/{s['image_filename']}",
+                occluded_image_url=f"/api/jobs/{job_id}/slides/{occ_fname}" if occ_fname else None,
+            )
         )
-        for s in slides
-    ]
+
     return JobResponse(
         id=job_id,
         source_type=SourceType(row["source_type"]),
         source_url=row["source_url"],
         video_title=row["video_title"],
         video_duration_sec=row["video_duration_sec"],
+        quality_mode=q_mode,
+        enhance_contrast=bool(row["enhance_contrast"]) if "enhance_contrast" in row_keys else False,
+        used_youtube_fallback=bool(row["used_youtube_fallback"]) if "used_youtube_fallback" in row_keys else False,
         rights_attested=bool(row["rights_attested"]),
         enable_temporal_inpainting=bool(row["enable_temporal_inpainting"]),
         enable_ocr_indexing=bool(row["enable_ocr_indexing"]),
@@ -404,6 +467,8 @@ def _row_to_job_response(row: sqlite3.Row, slides: List[sqlite3.Row]) -> JobResp
         extracted_slide_count=row["extracted_slide_count"],
         reconstructed_slide_count=row["reconstructed_slide_count"],
         pdf_download_url=pdf_url,
+        markdown_download_url=md_url,
+        zip_download_url=zip_url,
         pdf_file_size_bytes=row["pdf_file_size_bytes"],
         error_code=row["error_code"],
         error_message=row["error_message"],
@@ -413,7 +478,7 @@ def _row_to_job_response(row: sqlite3.Row, slides: List[sqlite3.Row]) -> JobResp
         started_at=row["started_at"],
         completed_at=row["completed_at"],
         expires_at=row["expires_at"],
-        slides=slide_Items,
+        slides=slide_items,
     )
 
 
